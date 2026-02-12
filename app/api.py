@@ -30,9 +30,12 @@ Endpoints Fase 3 (Constraint Demand):
 import os
 import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -580,3 +583,22 @@ def get_constraint_summary(sku_id: int, db: Session = Depends(get_db)):
             "detalles": lost.detalles if lost else None,
         } if lost else None,
     }
+
+
+# ─────────────────────────────────────────────
+# SPA Frontend: servir archivos estáticos del build de React
+# ─────────────────────────────────────────────
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+if STATIC_DIR.is_dir():
+    # Servir assets (JS, CSS, imágenes) directamente
+    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    def serve_spa(full_path: str):
+        """Catch-all: sirve index.html para cualquier ruta no-API (SPA routing)."""
+        file_path = STATIC_DIR / full_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(STATIC_DIR / "index.html")

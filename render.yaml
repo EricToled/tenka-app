@@ -1,0 +1,17 @@
+databases:
+  - name: tenka-db
+    plan: free
+    databaseName: tenka_db
+    user: tenka
+
+services:
+  - type: web
+    name: tenka-app
+    plan: free
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tenka-db
+          property: connectionString
