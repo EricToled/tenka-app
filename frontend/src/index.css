@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+
+  --color-tenka-bg: #050816;
+  --color-tenka-surface: #0a0f1e;
+  --color-tenka-card: #111827;
+  --color-tenka-border: #1e293b;
+  --color-tenka-accent: #3b82f6;
+  --color-tenka-accent2: #8b5cf6;
+  --color-tenka-success: #10b981;
+  --color-tenka-danger: #ef4444;
+  --color-tenka-warning: #f59e0b;
+  --color-tenka-text: #f1f5f9;
+  --color-tenka-muted: #94a3b8;
+}
+
+@layer base {
+  body {
+    @apply bg-tenka-bg text-tenka-text font-sans antialiased;
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-tenka-surface);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-tenka-border);
+    border-radius: 3px;
+  }
+}

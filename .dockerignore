@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.git
+.env
+*.dump
+frontend/
+node_modules/
+.vscode/
+*.md
+show_*.py
+truncate_all.py
+data/
