@@ -55,7 +55,7 @@ def available_months(db: Session = Depends(get_db)):
     para poblar dinamicamente el selector de mes en el frontend.
     """
     rows = (
-        db.query(DimTiempo.date_id, DimTiempo.anio, DimTiempo.mes)
+        db.query(DimTiempo.date_id, DimTiempo.anio, DimTiempo.mes_numero)
         .order_by(DimTiempo.date_id.desc())
         .all()
     )
@@ -67,7 +67,7 @@ def available_months(db: Session = Depends(get_db)):
     return [
         {
             "date_id": r.date_id,
-            "label": f"{meses_nombre.get(r.mes, r.mes)} {r.anio} ({r.date_id})",
+            "label": f"{meses_nombre.get(r.mes_numero, r.mes_numero)} {r.anio} ({r.date_id})",
         }
         for r in rows
     ]
