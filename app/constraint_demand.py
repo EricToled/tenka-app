@@ -33,24 +33,9 @@ from .models import (
     FactSalesInUnconstrained,
     RptLostSalesOos,
 )
-from .monthly_close import _compute_month_minus_n
+from .monthly_close import _compute_month_minus_n, _compute_month_plus_n
 
 logger = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
-
-def _compute_month_plus_n(date_id: int, n: int) -> int:
-    """Avanza n meses desde date_id (YYYYMM)."""
-    anio = date_id // 100
-    mes = date_id % 100
-    total_months = (anio * 12 + mes - 1) + n
-    new_anio = total_months // 12
-    new_mes = total_months % 12 + 1
-    return new_anio * 100 + new_mes
 
 
 def _get_projection_ids(mes_cierre_date_id: int) -> list[int]:
@@ -449,11 +434,8 @@ def compute_sales_in_constrained(
         inv_int_0 = _get_internal_inventory_initial(session, sku_id, mes_cierre_date_id)
         arrivals = _get_transit_arrivals_by_month(session, sku_id, projection_ids)
 
-        # Inventario disponible para la ventana 1..L
-        # Solo cuenta inventario inicial + transito (no POs, que llegan despues de L)
-        inv_available = inv_int_0
-        for t in range(min(L, len(projection_ids))):
-            inv_available += arrivals.get(projection_ids[t], 0.0)
+        # FIX LOG-06: Eliminado dead code inv_available (se calculaba pero no se usaba).
+        # El constraint real se maneja via inv_running progresivo mas abajo.
 
         # Obtener demanda por cliente-SKU-mes para este SKU
         si_unc_rows = (
@@ -668,7 +650,10 @@ def run_constraint_process(
         )
         summary["duracion_segundos"] = (datetime.now() - start_time).total_seconds()
 
-        session.commit()
+        # FIX BUG-05: No hacer commit aqui; dejar que el caller (api.py)
+        # controle la boundary transaccional. Solo flush para que los datos
+        # sean visibles dentro de la misma sesion.
+        session.flush()
         logger.info("run_constraint_process completado para mes %d", mes_cierre_date_id)
         return summary
 

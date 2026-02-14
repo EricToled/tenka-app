@@ -214,11 +214,14 @@ def load_sales_out(path: str, session: Session | None = None) -> int:
             if fecha_inicial is None or fecha_final is None:
                 continue
 
-            # Derivar date_id: preferir anio + mes_numero si existen, sino desde fecha
+            # FIX BUG-04: Siempre validar date_id contra dim_tiempo.
+            # compute_date_id no verificaba la BD y podia insertar datos
+            # con date_id inexistentes, rompiendo FKs y queries posteriores.
             anio = safe_int(row.get("anio"))
             mes = safe_int(row.get("mes_numero"))
             if anio > 0 and 1 <= mes <= 12:
-                date_id = compute_date_id(anio, mes)
+                from datetime import date as _date
+                date_id = get_date_id_from_date(session, _date(anio, mes, 1))
             else:
                 date_id = get_date_id_from_date(session, fecha_inicial)
 
@@ -292,10 +295,11 @@ def load_stock_consolidated(path: str, session: Session | None = None) -> int:
             if fecha_inicial is None or fecha_final is None:
                 continue
 
-            # Derivar date_id desde anio + mes de fecha_inicial
+            # FIX BUG-04: Validar contra dim_tiempo siempre
             anio = safe_int(row.get("anio"))
             if anio > 0:
-                date_id = compute_date_id(anio, fecha_inicial.month)
+                from datetime import date as _date
+                date_id = get_date_id_from_date(session, _date(anio, fecha_inicial.month, 1))
             else:
                 date_id = get_date_id_from_date(session, fecha_inicial)
 

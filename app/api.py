@@ -70,10 +70,22 @@ from .monthly_process import run_monthly_process
 from .report_generator import generate_aggregated_report
 from .time_dimension import ensure_time_dimension
 
+# FIX INF-04: Reemplazado @app.on_event("startup") deprecado con lifespan
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Crea las tablas en la BD si no existen al iniciar."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
 app = FastAPI(
     title="Tenka Inventory & Sales Control",
     description="API para ingesta de datos y control de inventarios con esquema snowflake.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS — permite todas las origenes para staging/demo
@@ -88,12 +100,6 @@ app.add_middleware(
 # Registrar endpoints del frontend
 from .api_frontend import router as frontend_router  # noqa: E402
 app.include_router(frontend_router)
-
-
-@app.on_event("startup")
-def on_startup():
-    """Crea las tablas en la BD si no existen."""
-    Base.metadata.create_all(bind=engine)
 
 
 # ─────────────────────────────────────────────

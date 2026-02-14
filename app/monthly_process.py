@@ -132,9 +132,12 @@ def _compute_closing_month_inventory(
         prev_12_start = _compute_month_minus_n(mes_cierre_date_id, 12)
         prev_12_end = _compute_month_minus_n(mes_cierre_date_id, 1)
 
-        avg_ventas = (
+        # FIX LOG-01: Usar SUM/12 en lugar de AVG. AVG solo promedia los meses
+        # con datos (ej. si hay 3 meses, divide entre 3, no entre 12).
+        # La regla de negocio exige promediar sobre la ventana completa de 12 meses.
+        sum_ventas = (
             session.query(
-                func.avg(FactSalesOut.unidades_sales_out)
+                func.sum(FactSalesOut.unidades_sales_out)
             )
             .filter(
                 FactSalesOut.cliente_id == cliente_id,
@@ -144,7 +147,7 @@ def _compute_closing_month_inventory(
             )
             .scalar()
         )
-        avg_ventas = float(avg_ventas or 0)
+        avg_ventas = float(sum_ventas or 0) / 12.0
 
         if avg_ventas > 0:
             mos = inv_final_cierre / avg_ventas

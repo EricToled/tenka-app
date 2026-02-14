@@ -42,7 +42,7 @@ export default function Sidebar() {
       {/* Footer */}
       <div className="px-6 py-4 border-t border-tenka-border">
         <p className="text-xs text-tenka-muted">Staging Demo v1.0</p>
-        <p className="text-xs text-tenka-muted/60 mt-0.5">Mes cierre: 202507</p>
+        <p className="text-xs text-tenka-muted/60 mt-0.5">Control de inventarios</p>
       </div>
     </aside>
   )
