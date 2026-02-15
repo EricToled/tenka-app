@@ -233,6 +233,11 @@ def generate_report_24m_cliente(session, mes_cierre: int):
     Reporte a nivel CLIENTE TOTAL AGREGADO con 24 meses:
     - 12 meses historicos: Sales In hist, Inventario Final hist, DOS hist
     - 12 meses proyectados: Sales In Constrained, Inv Final Constrained, DOS Constrained
+
+    DOS se recalcula a nivel cliente agregado como:
+        DOS = (SUM_inv_final / (SUM_SO_trailing_N / N)) * 30
+    donde N = min(12, meses desde primera venta del cliente hasta mes anterior).
+    NO se usa AVG de DOS individuales por SKU.
     """
     logger.info("\n  --- Reporte 1: 24M por Cliente Total ---")
 
@@ -243,7 +248,94 @@ def generate_report_24m_cliente(session, mes_cierre: int):
     projection_ids = _generate_date_id_range(proy_start, proy_end)
 
     client_names = {r.cliente_id: r.cliente_nombre for r in session.query(DimCliente.cliente_id, DimCliente.cliente_nombre).all()}
+
+    # Pre-cargar primera fecha de venta (Sales Out) por cliente
+    # para determinar N = meses activos en lugar de siempre 12.
+    first_sale_by_client: dict[int, int] = {}
+    first_sale_rows = (
+        session.query(
+            FactSalesOut.cliente_id,
+            func.min(FactSalesOut.date_id).label("first_date"),
+        )
+        .group_by(FactSalesOut.cliente_id)
+        .all()
+    )
+    for r in first_sale_rows:
+        first_sale_by_client[r.cliente_id] = r.first_date
+
+    # Pre-cargar Sales Out historicas por (date_id, cliente_id) agregadas
+    # Necesitamos hasta 24 meses atras para ventana trailing completa
+    date_id_ventas_inicio = _compute_month_minus_n(date_id_inicio, 12)
+    all_so_range = _generate_date_id_range(date_id_ventas_inicio, mes_cierre)
+    hist_so_rows = (
+        session.query(
+            FactSalesOut.date_id,
+            FactSalesOut.cliente_id,
+            func.sum(FactSalesOut.unidades_sales_out).label("total"),
+        )
+        .filter(FactSalesOut.date_id.in_(all_so_range))
+        .group_by(FactSalesOut.date_id, FactSalesOut.cliente_id)
+        .all()
+    )
+    so_lookup: dict[tuple[int, int], float] = {}
+    for r in hist_so_rows:
+        so_lookup[(r.date_id, r.cliente_id)] = float(r.total or 0)
+
+    # Pre-cargar Sales Out Unconstrained proyectadas por (date_id, cliente_id)
+    proj_so_rows = (
+        session.query(
+            FactSalesOutUnconstrained.date_id,
+            FactSalesOutUnconstrained.cliente_id,
+            func.sum(FactSalesOutUnconstrained.unidades_sales_out_unc).label("total"),
+        )
+        .filter(FactSalesOutUnconstrained.date_id.in_(projection_ids))
+        .group_by(FactSalesOutUnconstrained.date_id, FactSalesOutUnconstrained.cliente_id)
+        .all()
+    )
+    for r in proj_so_rows:
+        so_lookup[(r.date_id, r.cliente_id)] = float(r.total or 0)
+
     rows = []
+
+    def _calc_dos_for_client(cid: int, current_did: int, inv_final: float, all_date_ids_up_to: list[int]) -> float | None:
+        """Calcula DOS agregado para un cliente en un mes dado.
+
+        DOS = (inv_final / (SUM_SO_trailing_N / N)) * 30
+        N = min(12, meses desde primera venta hasta mes anterior al calculo)
+        """
+        # Hasta 12 meses ANTERIORES al mes actual (sin incluir current_did)
+        idx = all_date_ids_up_to.index(current_did) if current_did in all_date_ids_up_to else -1
+        if idx <= 0:
+            return None  # Primer mes o no encontrado
+
+        start = max(0, idx - 12)
+        trailing_dids = all_date_ids_up_to[start:idx]
+
+        # Ajustar por fecha de inicio de operaciones
+        first_sale = first_sale_by_client.get(cid)
+        if first_sale is not None:
+            trailing_dids = [d for d in trailing_dids if d >= first_sale]
+
+        if not trailing_dids:
+            return None
+
+        trailing_so = sum(so_lookup.get((d, cid), 0.0) for d in trailing_dids)
+        n_months = len(trailing_dids)
+
+        if n_months > 0 and trailing_so > 0:
+            avg_monthly = trailing_so / n_months
+            return (inv_final / avg_monthly) * 30
+        return None
+
+    # Lista completa de date_ids para busqueda de indice
+    all_date_ids_ordered = sorted(all_so_range + historico_ids + projection_ids)
+    # Eliminar duplicados manteniendo orden
+    seen = set()
+    all_date_ids_unique = []
+    for d in all_date_ids_ordered:
+        if d not in seen:
+            seen.add(d)
+            all_date_ids_unique.append(d)
 
     # ── Datos historicos por cliente ──
     for date_id in historico_ids:
@@ -269,30 +361,20 @@ def generate_report_24m_cliente(session, mes_cierre: int):
             .all()
         )
 
-        # DOS historico por cliente (promedio ponderado via inventario/SO)
-        dos_rows = (
-            session.query(
-                FactDiasInventarioHistorico.cliente_id,
-                func.avg(FactDiasInventarioHistorico.days_of_sale_historico).label("dos"),
-            )
-            .filter(FactDiasInventarioHistorico.date_id == date_id)
-            .group_by(FactDiasInventarioHistorico.cliente_id)
-            .all()
-        )
-
         si_map = {r.cliente_id: float(r.sales_in or 0) for r in si_rows}
         inv_map = {r.cliente_id: float(r.inv or 0) for r in inv_rows}
-        dos_map = {r.cliente_id: float(r.dos) if r.dos is not None else None for r in dos_rows}
 
         all_clients = set(si_map.keys()) | set(inv_map.keys())
         for cid in all_clients:
+            inv_val = inv_map.get(cid, 0)
+            dos_val = _calc_dos_for_client(cid, date_id, inv_val, all_date_ids_unique)
             rows.append({
                 "cliente": client_names.get(cid, f"CLIENTE_{cid}"),
                 "date_id": date_id,
                 "tipo": "HISTORICO",
                 "sales_in": si_map.get(cid, 0),
-                "inventario_final": inv_map.get(cid, 0),
-                "days_of_sale": dos_map.get(cid, None),
+                "inventario_final": inv_val,
+                "days_of_sale": dos_val,
             })
 
     # ── Datos proyectados Constrained por cliente ──
@@ -308,12 +390,11 @@ def generate_report_24m_cliente(session, mes_cierre: int):
             .all()
         )
 
-        # Inventario Unconstrained por cliente (no hay inventario constrained a nivel cliente)
+        # Inventario Unconstrained por cliente
         inv_unc_rows = (
             session.query(
                 FactInventoryUnconstrained.cliente_id,
                 func.sum(FactInventoryUnconstrained.inventario_final_unc).label("inv"),
-                func.avg(FactInventoryUnconstrained.days_of_sale_unc).label("dos"),
             )
             .filter(FactInventoryUnconstrained.date_id == date_id)
             .group_by(FactInventoryUnconstrained.cliente_id)
@@ -322,17 +403,18 @@ def generate_report_24m_cliente(session, mes_cierre: int):
 
         si_map = {r.cliente_id: float(r.sales_in or 0) for r in si_constr_rows}
         inv_map = {r.cliente_id: float(r.inv or 0) for r in inv_unc_rows}
-        dos_map = {r.cliente_id: float(r.dos) if r.dos is not None else None for r in inv_unc_rows}
 
         all_clients = set(si_map.keys()) | set(inv_map.keys())
         for cid in all_clients:
+            inv_val = inv_map.get(cid, 0)
+            dos_val = _calc_dos_for_client(cid, date_id, inv_val, all_date_ids_unique)
             rows.append({
                 "cliente": client_names.get(cid, f"CLIENTE_{cid}"),
                 "date_id": date_id,
                 "tipo": "PROYECTADO_CONSTRAINED",
                 "sales_in": si_map.get(cid, 0),
-                "inventario_final": inv_map.get(cid, 0),
-                "days_of_sale": dos_map.get(cid, None),
+                "inventario_final": inv_val,
+                "days_of_sale": dos_val,
             })
 
     df = pd.DataFrame(rows)

@@ -89,6 +89,21 @@ def build_historical_dos(session: Session, mes_cierre_date_id: int) -> int:
     for row in sales_data:
         sales_lookup[(row.date_id, row.cliente_id, row.sku_id)] = float(row.total or 0)
 
+    # Pre-calcular fecha de primera venta (Sales Out) por par cliente-SKU
+    # para determinar N = meses activos en vez de siempre 12.
+    first_sale_date: dict[tuple[int, int], int] = {}
+    first_sale_rows = (
+        session.query(
+            FactSalesOut.cliente_id,
+            FactSalesOut.sku_id,
+            func.min(FactSalesOut.date_id).label("first_date"),
+        )
+        .group_by(FactSalesOut.cliente_id, FactSalesOut.sku_id)
+        .all()
+    )
+    for r in first_sale_rows:
+        first_sale_date[(r.cliente_id, r.sku_id)] = r.first_date
+
     inserted = 0
 
     for rec in stock_records:
@@ -97,15 +112,40 @@ def build_historical_dos(session: Session, mes_cierre_date_id: int) -> int:
         sku_id = rec.sku_id
         inv_final = float(rec.inventario_final_unidades or 0)
 
-        # Calcular promedio de ventas de los 12 meses anteriores al mes actual
+        # Ventana maxima: 12 meses anteriores al mes actual
         prev_12_start = _compute_month_minus_n(current_date_id, 12)
         prev_12_end = _compute_month_minus_n(current_date_id, 1)
         prev_12_ids = _generate_date_id_range(prev_12_start, prev_12_end)
+
+        # Ajustar ventana por fecha de inicio de operaciones del par cliente-SKU.
+        # Si la primera venta es posterior al inicio de la ventana de 12 meses,
+        # solo consideramos desde la primera venta.
+        first_date = first_sale_date.get((cliente_id, sku_id))
+        if first_date is not None and first_date > prev_12_start:
+            # Solo tomar meses desde first_date hasta prev_12_end
+            prev_12_ids = [d for d in prev_12_ids if d >= first_date]
+
+        # Si no hay meses anteriores con ventas posibles, DOS = 0/NULL
+        if not prev_12_ids:
+            # Primer mes de operacion: no hay meses anteriores
+            registro = FactDiasInventarioHistorico(
+                date_id=current_date_id,
+                cliente_id=cliente_id,
+                sku_id=sku_id,
+                inventario_final=inv_final,
+                promedio_ventas_12m=None,
+                months_of_sale_historico=None,
+                days_of_sale_historico=None,
+            )
+            session.add(registro)
+            inserted += 1
+            continue
 
         total_ventas = sum(
             sales_lookup.get((did, cliente_id, sku_id), 0.0)
             for did in prev_12_ids
         )
+        # N = numero de meses efectivos (no siempre 12)
         meses_con_datos = len(prev_12_ids)
         promedio_ventas = total_ventas / meses_con_datos if meses_con_datos > 0 else 0.0
 

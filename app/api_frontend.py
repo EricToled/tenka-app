@@ -151,6 +151,10 @@ def unconstrained_summary(
         total_so_12m = float(so_q.scalar() or 0)
 
         if total_so_12m > 0:
+            # Para datos proyectados, los 12 meses siempre estan poblados
+            # para todos los pares elegibles, por lo que /12 es correcto.
+            # (La logica de N ajustado por first_sale_date ya fue aplicada
+            # a nivel SKU-cliente en unconstrained_demand._iterative_projection)
             avg_monthly_so = total_so_12m / 12
             avg_dos = round((total_inv / avg_monthly_so) * 30, 1)
         else:
@@ -221,6 +225,7 @@ def unconstrained_summary(
     for r in by_familia:
         inv = familia_inv.get(r.familia, 0)
         so_total = familia_so.get(r.familia, 0)
+        # Datos proyectados: 12 meses siempre poblados para elegibles → /12 correcto
         avg_monthly = so_total / 12 if so_total > 0 else 0
         mos = inv / avg_monthly if avg_monthly > 0 else 0
         dos = mos * 30
@@ -285,6 +290,7 @@ def unconstrained_summary(
             inv_val = inv_cli_map.get(cli_name, 0)
             so_val = so_cli_map.get(cli_name, 0)
             if so_val > 0:
+                # Datos proyectados: 12 meses siempre poblados → /12 correcto
                 avg_monthly = so_val / 12
                 cliente_dos[cli_name] = (inv_val / avg_monthly) * 30
             else:

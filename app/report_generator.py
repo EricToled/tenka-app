@@ -8,7 +8,8 @@ Niveles:
     4. TOTAL_TENKA       — Gran total
 
 DOS en niveles agregados se RECALCULA desde valores agregados:
-    DOS = (SUM_inventario_final / (SUM_sales_out_12m / 12)) * 30
+    DOS = (SUM_inventario_final / (SUM_sales_out_Nm / N)) * 30
+    donde N = min(12, meses desde inicio de operaciones hasta mes anterior)
 NO se promedia el DOS de los SKUs individuales.
 """
 
@@ -323,7 +324,11 @@ def _aggregate_level(
     """
     Agrega el nivel 1 a un nivel superior, recalculando DOS desde valores agregados.
 
-    DOS = (SUM_inv / (SUM_SO_trailing_12m / 12)) * 30
+    DOS = (SUM_inv / (SUM_SO_trailing_Nm / N)) * 30
+    donde N = min(12, meses desde inicio de operaciones hasta mes anterior al calculo).
+
+    Para niveles agregados (familia, cliente total, total tenka), el inicio de
+    operaciones se determina como el primer mes con sales_out > 0 en el grupo.
 
     Args:
         df_level1: DataFrame del nivel 1 (CLIENTE_SKU).
@@ -353,8 +358,8 @@ def _aggregate_level(
     )
 
     # Recalcular DOS para cada grupo y date_id
-    # DOS = (inv_final / (sum_so_trailing_12m / 12)) * 30
-    # Para calcular trailing 12m, necesitamos la serie completa de sales_out por grupo.
+    # DOS = (inv_final / (sum_so_trailing_Nm / N)) * 30
+    # N = min(12, meses desde primera venta del grupo hasta mes anterior)
 
     # Construir lookup de sales_out por grupo y date_id
     so_by_group = {}
@@ -364,20 +369,36 @@ def _aggregate_level(
             so_by_group[key] = {}
         so_by_group[key][row["date_id"]] = row["sales_out"]
 
+    # Determinar fecha de primera venta (sales_out > 0) por grupo
+    first_sale_by_group: dict[tuple, int] = {}
+    sorted_dates = sorted(all_date_ids)
+    for key, so_dict in so_by_group.items():
+        for did in sorted_dates:
+            if so_dict.get(did, 0) > 0:
+                first_sale_by_group[key] = did
+                break
+
     # Calcular DOS
     dos_values = []
-    sorted_dates = sorted(all_date_ids)
     for _, row in agg.iterrows():
         key = tuple(row[c] for c in group_cols) if group_cols else ("ALL",)
         current_did = row["date_id"]
         inv = row["inventario_final"]
 
-        # Trailing 12 meses de sales_out (incluyendo el mes actual)
+        # Trailing N meses de sales_out ANTERIORES al mes actual
+        # (no incluye el mes actual — DOS usa meses previos)
         idx = sorted_dates.index(current_did) if current_did in sorted_dates else -1
-        if idx >= 0:
-            trailing_dids = sorted_dates[max(0, idx - 11): idx + 1]
+        if idx > 0:
+            # Hasta 12 meses anteriores (sin incluir current_did)
+            start = max(0, idx - 12)
+            trailing_dids = sorted_dates[start:idx]
         else:
             trailing_dids = []
+
+        # Ajustar por fecha de inicio de operaciones del grupo
+        first_sale = first_sale_by_group.get(key)
+        if first_sale is not None:
+            trailing_dids = [d for d in trailing_dids if d >= first_sale]
 
         so_group = so_by_group.get(key, {})
         trailing_so = sum(so_group.get(d, 0) for d in trailing_dids)
