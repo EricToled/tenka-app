@@ -127,20 +127,34 @@ def unconstrained_summary(
     kpi_q = _apply_si_unc_filters(kpi_q)
     total_si_unc = kpi_q.scalar() or 0
 
-    # DOS promedio ponderado (inventario / ventas) en ultimo mes
+    # DOS ponderado = (SUM inventario_final / (SUM sales_out_12m / 12)) * 30
+    # NO usar AVG simple de DOS individuales — los outliers (SKUs con poco
+    # movimiento y mucho inventario) inflan el promedio artificialmente.
     last_proj = proj_ids[-1] if proj_ids else None
     avg_dos = None
     if last_proj:
-        dos_q = (
-            db.query(func.avg(FactInventoryUnconstrained.days_of_sale_unc))
-            .filter(
-                FactInventoryUnconstrained.date_id == last_proj,
-                FactInventoryUnconstrained.days_of_sale_unc.isnot(None),
-            )
+        inv_q = (
+            db.query(func.sum(FactInventoryUnconstrained.inventario_final_unc))
+            .filter(FactInventoryUnconstrained.date_id == last_proj)
         )
-        dos_q = _apply_inv_unc_filters(dos_q)
-        avg_dos_val = dos_q.scalar()
-        avg_dos = round(float(avg_dos_val), 1) if avg_dos_val else None
+        inv_q = _apply_inv_unc_filters(inv_q)
+        total_inv = float(inv_q.scalar() or 0)
+
+        so_q = (
+            db.query(func.sum(FactSalesOutUnconstrained.unidades_sales_out_unc))
+            .filter(FactSalesOutUnconstrained.date_id.in_(proj_ids))
+        )
+        if sku_filter_ids is not None:
+            so_q = so_q.filter(FactSalesOutUnconstrained.sku_id.in_(sku_filter_ids))
+        if cliente_filter_id is not None:
+            so_q = so_q.filter(FactSalesOutUnconstrained.cliente_id == cliente_filter_id)
+        total_so_12m = float(so_q.scalar() or 0)
+
+        if total_so_12m > 0:
+            avg_monthly_so = total_so_12m / 12
+            avg_dos = round((total_inv / avg_monthly_so) * 30, 1)
+        else:
+            avg_dos = None
 
     # Clientes en riesgo de sobreinventario (MOS > 3 en ultimo mes)
     riesgo_count = 0
@@ -234,23 +248,47 @@ def unconstrained_summary(
         .all()
     )
 
-    # DOS promedio por cliente en ultimo mes
+    # DOS ponderado por cliente = (SUM inv_cli / (SUM so_cli_12m / 12)) * 30
+    # NO usar AVG simple de DOS individuales por SKU.
     cliente_dos = {}
     if last_proj:
-        dos_cli_q = (
+        # Inventario por cliente en ultimo mes
+        inv_cli_q = (
             db.query(
                 DimCliente.cliente_nombre.label("cliente"),
-                func.avg(FactInventoryUnconstrained.days_of_sale_unc).label("dos"),
+                func.sum(FactInventoryUnconstrained.inventario_final_unc).label("inv"),
             )
             .join(DimCliente, FactInventoryUnconstrained.cliente_id == DimCliente.cliente_id)
-            .filter(
-                FactInventoryUnconstrained.date_id == last_proj,
-                FactInventoryUnconstrained.days_of_sale_unc.isnot(None),
-            )
+            .filter(FactInventoryUnconstrained.date_id == last_proj)
         )
-        dos_cli_q = _apply_inv_unc_filters(dos_cli_q)
-        dos_by_cli = dos_cli_q.group_by(DimCliente.cliente_nombre).all()
-        cliente_dos = {r.cliente: float(r.dos) for r in dos_by_cli}
+        inv_cli_q = _apply_inv_unc_filters(inv_cli_q)
+        inv_by_cli = inv_cli_q.group_by(DimCliente.cliente_nombre).all()
+        inv_cli_map = {r.cliente: float(r.inv or 0) for r in inv_by_cli}
+
+        # Sales Out 12M por cliente
+        so_cli_q = (
+            db.query(
+                DimCliente.cliente_nombre.label("cliente"),
+                func.sum(FactSalesOutUnconstrained.unidades_sales_out_unc).label("so"),
+            )
+            .join(DimCliente, FactSalesOutUnconstrained.cliente_id == DimCliente.cliente_id)
+            .filter(FactSalesOutUnconstrained.date_id.in_(proj_ids))
+        )
+        if sku_filter_ids is not None:
+            so_cli_q = so_cli_q.filter(FactSalesOutUnconstrained.sku_id.in_(sku_filter_ids))
+        if cliente_filter_id is not None:
+            so_cli_q = so_cli_q.filter(FactSalesOutUnconstrained.cliente_id == cliente_filter_id)
+        so_by_cli = so_cli_q.group_by(DimCliente.cliente_nombre).all()
+        so_cli_map = {r.cliente: float(r.so or 0) for r in so_by_cli}
+
+        for cli_name in inv_cli_map:
+            inv_val = inv_cli_map.get(cli_name, 0)
+            so_val = so_cli_map.get(cli_name, 0)
+            if so_val > 0:
+                avg_monthly = so_val / 12
+                cliente_dos[cli_name] = (inv_val / avg_monthly) * 30
+            else:
+                cliente_dos[cli_name] = 0
 
     cliente_data = [
         {
