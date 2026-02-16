@@ -24,10 +24,13 @@ from .models import (
     DimCliente,
     DimSku,
     FactDiasInventarioHistorico,
+    FactInventoryClienteConstrained,
     FactInventoryUnconstrained,
     FactSalesIn,
+    FactSalesInConstrained,
     FactSalesInUnconstrained,
     FactSalesOut,
+    FactSalesOutConstrained,
     FactSalesOutUnconstrained,
     FactStockCliente,
 )
@@ -439,3 +442,246 @@ def _aggregate_level(
             agg[c] = None
 
     return agg[cols]
+
+
+# ─────────────────────────────────────────────
+# STEP 15: CONSTRAINED AGGREGATED REPORT
+# ─────────────────────────────────────────────
+
+
+def generate_constrained_report(
+    session: Session,
+    mes_cierre_date_id: int,
+) -> pd.DataFrame:
+    """
+    Mirror structure of generate_aggregated_report but read from:
+    - FactSalesOutConstrained instead of FactSalesOutUnconstrained
+    - FactSalesInConstrained instead of FactSalesInUnconstrained
+    - FactInventoryClienteConstrained instead of FactInventoryUnconstrained
+
+    Keep same 4 levels (CLIENTE_SKU, CLIENTE_FAMILIA, CLIENTE_TOTAL, TOTAL_TENKA).
+    Recalculate DOS at aggregated levels using same formula.
+    """
+    # ── Build time windows ──
+    date_id_inicio = _compute_month_minus_n(mes_cierre_date_id, 11)
+    historico_ids = _generate_date_id_range(date_id_inicio, mes_cierre_date_id)
+
+    mes_m = mes_cierre_date_id % 100
+    mes_a = mes_cierre_date_id // 100
+    proy_start = (mes_a * 100 + mes_m + 1) if mes_m < 12 else ((mes_a + 1) * 100 + 1)
+    projection_ids = []
+    current = proy_start
+    for _ in range(12):
+        projection_ids.append(current)
+        m = current % 100
+        a = current // 100
+        current = (a * 100 + m + 1) if m < 12 else ((a + 1) * 100 + 1)
+
+    all_date_ids = historico_ids + projection_ids
+
+    # ── Load SKU info ──
+    sku_info = {}
+    for row in session.query(DimSku.sku_id, DimSku.familia, DimSku.sku_descripcion, DimSku.upc).all():
+        sku_info[row.sku_id] = {
+            "familia": row.familia or "SIN_FAMILIA",
+            "descripcion": row.sku_descripcion,
+            "upc": row.upc,
+        }
+
+    # ── Load client names ──
+    client_names = {}
+    for row in session.query(DimCliente.cliente_id, DimCliente.cliente_nombre).all():
+        client_names[row.cliente_id] = row.cliente_nombre
+
+    # ── LEVEL 1: CLIENTE_SKU ──
+    rows = []
+
+    # Historical data (same as unconstrained — uses actual history)
+    hist_so = (
+        session.query(
+            FactSalesOut.cliente_id,
+            FactSalesOut.sku_id,
+            FactSalesOut.date_id,
+            func.sum(FactSalesOut.unidades_sales_out).label("val"),
+        )
+        .filter(FactSalesOut.date_id.in_(historico_ids))
+        .group_by(FactSalesOut.cliente_id, FactSalesOut.sku_id, FactSalesOut.date_id)
+        .all()
+    )
+    hist_si = (
+        session.query(
+            FactSalesIn.cliente_id,
+            FactSalesIn.sku_id,
+            FactSalesIn.date_id,
+            func.sum(FactSalesIn.unidades_sales_in).label("val"),
+        )
+        .filter(FactSalesIn.date_id.in_(historico_ids))
+        .group_by(FactSalesIn.cliente_id, FactSalesIn.sku_id, FactSalesIn.date_id)
+        .all()
+    )
+    hist_inv = (
+        session.query(
+            FactStockCliente.cliente_id,
+            FactStockCliente.sku_id,
+            FactStockCliente.date_id,
+            func.sum(FactStockCliente.inventario_final_unidades).label("val"),
+        )
+        .filter(FactStockCliente.date_id.in_(historico_ids))
+        .group_by(FactStockCliente.cliente_id, FactStockCliente.sku_id, FactStockCliente.date_id)
+        .all()
+    )
+    hist_dos = (
+        session.query(
+            FactDiasInventarioHistorico.cliente_id,
+            FactDiasInventarioHistorico.sku_id,
+            FactDiasInventarioHistorico.date_id,
+            FactDiasInventarioHistorico.days_of_sale_historico.label("val"),
+        )
+        .filter(FactDiasInventarioHistorico.date_id.in_(historico_ids))
+        .all()
+    )
+
+    def _to_lookup(query_result):
+        lk = {}
+        for r in query_result:
+            lk[(r.cliente_id, r.sku_id, r.date_id)] = float(r.val or 0)
+        return lk
+
+    so_lk = _to_lookup(hist_so)
+    si_lk = _to_lookup(hist_si)
+    inv_lk = _to_lookup(hist_inv)
+    dos_lk = _to_lookup(hist_dos)
+
+    all_hist_keys = set(so_lk.keys()) | set(si_lk.keys()) | set(inv_lk.keys())
+    hist_pairs = {(k[0], k[1]) for k in all_hist_keys}
+
+    for cid, sid in sorted(hist_pairs):
+        cliente_nombre = client_names.get(cid, f"CLIENTE_{cid}")
+        info = sku_info.get(sid, {"familia": "SIN_FAMILIA", "descripcion": f"SKU_{sid}", "upc": 0})
+        for did in historico_ids:
+            rows.append({
+                "level": 1,
+                "nivel_nombre": "CLIENTE_SKU",
+                "cliente": cliente_nombre,
+                "familia": info["familia"],
+                "sku_descripcion": info["descripcion"],
+                "upc": info["upc"],
+                "date_id": did,
+                "tipo": "HISTORICO",
+                "sales_out": so_lk.get((cid, sid, did), 0),
+                "sales_in": si_lk.get((cid, sid, did), 0),
+                "inventario_final": inv_lk.get((cid, sid, did), 0),
+                "days_of_sale": dos_lk.get((cid, sid, did), None),
+                "_cliente_id": cid,
+                "_sku_id": sid,
+            })
+
+    # Projected data — read from CONSTRAINED tables
+    proj_so = (
+        session.query(
+            FactSalesOutConstrained.cliente_id,
+            FactSalesOutConstrained.sku_id,
+            FactSalesOutConstrained.date_id,
+            func.sum(FactSalesOutConstrained.unidades_sales_out_constr).label("val"),
+        )
+        .filter(FactSalesOutConstrained.date_id.in_(projection_ids))
+        .group_by(
+            FactSalesOutConstrained.cliente_id,
+            FactSalesOutConstrained.sku_id,
+            FactSalesOutConstrained.date_id,
+        )
+        .all()
+    )
+    proj_si = (
+        session.query(
+            FactSalesInConstrained.cliente_id,
+            FactSalesInConstrained.sku_id,
+            FactSalesInConstrained.date_id,
+            func.sum(FactSalesInConstrained.unidades_sales_in_constr).label("val"),
+        )
+        .filter(FactSalesInConstrained.date_id.in_(projection_ids))
+        .group_by(
+            FactSalesInConstrained.cliente_id,
+            FactSalesInConstrained.sku_id,
+            FactSalesInConstrained.date_id,
+        )
+        .all()
+    )
+    proj_inv = (
+        session.query(
+            FactInventoryClienteConstrained.cliente_id,
+            FactInventoryClienteConstrained.sku_id,
+            FactInventoryClienteConstrained.date_id,
+            func.sum(FactInventoryClienteConstrained.inventario_final_cliente_constr).label("inv"),
+            FactInventoryClienteConstrained.days_of_sale_cli_constr.label("dos"),
+        )
+        .filter(FactInventoryClienteConstrained.date_id.in_(projection_ids))
+        .group_by(
+            FactInventoryClienteConstrained.cliente_id,
+            FactInventoryClienteConstrained.sku_id,
+            FactInventoryClienteConstrained.date_id,
+            FactInventoryClienteConstrained.days_of_sale_cli_constr,
+        )
+        .all()
+    )
+
+    pso_lk = _to_lookup(proj_so)
+    psi_lk = _to_lookup(proj_si)
+    pinv_lk = {}
+    pdos_lk = {}
+    for r in proj_inv:
+        key = (r.cliente_id, r.sku_id, r.date_id)
+        pinv_lk[key] = float(r.inv or 0)
+        pdos_lk[key] = float(r.dos) if r.dos is not None else None
+
+    all_proj_keys = set(pso_lk.keys()) | set(psi_lk.keys()) | set(pinv_lk.keys())
+    proj_pairs = {(k[0], k[1]) for k in all_proj_keys}
+
+    for cid, sid in sorted(proj_pairs):
+        cliente_nombre = client_names.get(cid, f"CLIENTE_{cid}")
+        info = sku_info.get(sid, {"familia": "SIN_FAMILIA", "descripcion": f"SKU_{sid}", "upc": 0})
+        for did in projection_ids:
+            rows.append({
+                "level": 1,
+                "nivel_nombre": "CLIENTE_SKU",
+                "cliente": cliente_nombre,
+                "familia": info["familia"],
+                "sku_descripcion": info["descripcion"],
+                "upc": info["upc"],
+                "date_id": did,
+                "tipo": "CONSTRAINED",
+                "sales_out": pso_lk.get((cid, sid, did), 0),
+                "sales_in": psi_lk.get((cid, sid, did), 0),
+                "inventario_final": pinv_lk.get((cid, sid, did), 0),
+                "days_of_sale": pdos_lk.get((cid, sid, did), None),
+                "_cliente_id": cid,
+                "_sku_id": sid,
+            })
+
+    if not rows:
+        logger.warning("No constrained report data.")
+        return pd.DataFrame()
+
+    df1 = pd.DataFrame(rows)
+
+    # ── LEVEL 2-4: Aggregated levels (reuse same function) ──
+    df2 = _aggregate_level(df1, ["cliente", "familia"], "CLIENTE_FAMILIA", 2, all_date_ids)
+    df3 = _aggregate_level(df1, ["cliente"], "CLIENTE_TOTAL", 3, all_date_ids)
+    df4 = _aggregate_level(df1, [], "TOTAL_TENKA", 4, all_date_ids)
+
+    result = pd.concat([df1, df2, df3, df4], ignore_index=True)
+
+    for col in ["sales_out", "sales_in", "inventario_final", "days_of_sale"]:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce").round(2)
+
+    result = result.sort_values(
+        ["level", "cliente", "familia", "sku_descripcion", "date_id"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    logger.info(
+        "Constrained report: %d rows, %d levels",
+        len(result), result["level"].nunique(),
+    )
+    return result

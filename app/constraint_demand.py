@@ -1,35 +1,21 @@
 """
 constraint_demand.py — Fase 3: Constraint Demand.
 
-Refactor Fase A v2 (feb 2026) — Correcciones post-auditoria de inconsistencias:
-    P1: Inventario teorico se calcula 1..12 (no solo 1..L).
-    P2: POs con logica secuencial PO1..PO(L+1) por ventanas de L meses.
-    P3: Inventario final Constraint: periodos 1..L truncados a 0 despues de PO1;
-        periodos L+1..12 negativos = error de proceso (NO truncar).
-    I1: Asignacion de inventario limitado: secuencial por tamaño (mayor a menor).
-    I2: Sin cascada oos_triggered; cada mes se evalua independiente con inv_running.
+Refactor v3 (feb 2026) — Rewrite per Agent Execution Plan v2:
+    §3.3: Inventario teorico 1..12 permite negativos, in-memory only.
+    §3.4: POs secuenciales PO1..PO5 con ventanas de L meses de demanda.
+         Post-PO1 truncation only on periods 0..L-1.
+    §4:   Inventario final Constraint: periodos 1..L truncados, L+1..12 negativo = ERROR.
+    §3.5: Sales In Constrained: sequential by size DESC, no oos_triggered cascade,
+         arrivals added per-month only (not pre-summed).
+    §6:   Gate: allocation report, validation (cumulative), apply edits.
 
-Calcula, para cada SKU y horizonte de 12 meses de proyeccion:
-    1. Inventario interno teorico 1..12 (permite negativos, en memoria).
-    2. POs secuenciales: PO1..PO(L+1) con ventanas de L meses de demanda.
-    3. Inventario interno final Constraint 1..12.
-    4. Sales In Constrained (limitadas por stock interno en ventana 1..L).
-    5. Lost Sales por OOS en ventana de lead time.
-
-Invariantes:
-    - Todos los calculos de inventario interno son a nivel SKU global (no por cliente).
-    - Fase 3 NO recalcula ni toca Sales Out (eso es Fase B).
-    - Lead time por SKU (DimSku.lead_time_meses), default 4.
-
-Reglas de truncamiento:
-    - Inventario teorico periodos 1..L: truncar negativos a 0 SOLO despues de PO1.
-    - Inventario final Constraint periodos 1..L: = inv_teo truncado (pueden ser 0).
-    - Inventario final Constraint periodos L+1..12: negativo = ERROR de proceso.
-
-Flujo de proceso (Fase A — solo hasta Sales In Constraint):
-    run_constraint_process → genera POs, inventario constraint, SI constrained.
-    Despues de esto, el sistema genera un reporte de asignacion editable (gate bloqueante).
-    Solo tras aprobacion del usuario se ejecuta Fase B (Sales Out Constraint).
+Convenciones:
+    - Round all numeric values to 4 decimals before DB storage.
+    - Never call session.commit() inside business logic. Only API endpoints commit.
+    - Use session.flush() after batch inserts.
+    - Variable L = _get_lead_time(session, sku_id) (default 4). Do not hardcode 4.
+    - projection_ids = list of 12 date_id values (months 1-12 after close).
 """
 
 import json
@@ -41,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from .eligibility import _generate_date_id_range
 from .models import (
+    DimCliente,
     DimSku,
     FactInventarioInterno,
     FactInventarioTransito,
@@ -48,7 +35,8 @@ from .models import (
     FactPoInterno,
     FactSalesInConstrained,
     FactSalesInUnconstrained,
-    RptAsignacionInventario,
+    FactSalesOutConstrained,
+    FactInventoryClienteConstrained,
     RptLostSalesOos,
 )
 from .monthly_close import _compute_month_minus_n
@@ -161,7 +149,6 @@ def _get_transit_arrivals_by_month(
 def _get_lead_time(session: Session, sku_id: int) -> int:
     """
     Obtiene el lead time en meses para un SKU. Default 4.
-    Loguea warning si el SKU no tiene lead_time_meses definido.
     """
     sku = session.get(DimSku, sku_id)
     if sku and sku.lead_time_meses:
@@ -173,229 +160,192 @@ def _get_lead_time(session: Session, sku_id: int) -> int:
 
 
 # ─────────────────────────────────────────────
-# PASO 1: INVENTARIO INTERNO TEORICO 1..12 (EN MEMORIA)
+# STEP 2: INVENTARIO TEORICO 1..12 (§3.3)
 # ─────────────────────────────────────────────
 
 
-def _compute_theoretical_inventory(
-    inv_hist: float,
-    demand: dict[int, float],
-    arrivals: dict[int, float],
-    projection_ids: list[int],
-) -> list[float]:
+def compute_theoretical_inventory(
+    session: Session,
+    mes_cierre_date_id: int,
+) -> dict[int, dict[int, float]]:
     """
-    Calcula inventario interno teorico para los 12 periodos de proyeccion.
-    Solo usa inventario inicial + demanda SI_unc + llegadas de transito.
-    NO incluye POs. SE PERMITEN NEGATIVOS.
+    Calcula inventario teorico para TODOS los SKUs, 12 periodos de proyeccion.
 
-    Formulas:
-        inv_teo[1] = inv_hist - SI_unc_1 + Arrivals_1
-        inv_teo[t] = inv_teo[t-1] - SI_unc_t + Arrivals_t   (t=2..12)
+    Formulas (§3.3):
+        inv_teo[1] = inv_hist - SI_unc[1] + Arrivals[1]  # §3.3: negatives allowed
+        inv_teo[t] = inv_teo[t-1] - SI_unc[t] + Arrivals[t]  # §3.3: negatives allowed
+
+    Negativos permitidos. NO persiste a DB — retorna en memoria.
 
     Returns:
-        Lista de 12 floats con inventario teorico (puede contener negativos).
+        {sku_id: {date_id: inv_teo_value}} for all 12 projection months.
     """
-    inv_teo = [0.0] * len(projection_ids)
-    inv_prev = inv_hist
+    projection_ids = _get_projection_ids(mes_cierre_date_id)
+    sku_ids = _get_skus_with_demand(session, projection_ids)
 
-    for t in range(len(projection_ids)):
-        did = projection_ids[t]
-        d = demand.get(did, 0.0)
-        a = arrivals.get(did, 0.0)
-        inv_teo[t] = inv_prev - d + a
-        inv_prev = inv_teo[t]
+    inv_teo_all: dict[int, dict[int, float]] = {}
 
-    return inv_teo
+    for sku_id in sku_ids:
+        inv_hist = _get_internal_inventory_initial(session, sku_id, mes_cierre_date_id)
+        demand = _get_demand_by_month(session, sku_id, projection_ids)
+        arrivals = _get_transit_arrivals_by_month(session, sku_id, projection_ids)
+
+        inv_teo: dict[int, float] = {}
+        inv_prev = inv_hist
+
+        for t in range(len(projection_ids)):
+            did = projection_ids[t]
+            d = demand.get(did, 0.0)
+            a = arrivals.get(did, 0.0)
+            inv_teo[did] = round(inv_prev - d + a, 4)  # §3.3: negatives allowed
+            inv_prev = inv_teo[did]
+
+        inv_teo_all[sku_id] = inv_teo
+
+    logger.info(
+        "compute_theoretical_inventory: %d SKUs, 12 months each",
+        len(sku_ids),
+    )
+    return inv_teo_all
 
 
 # ─────────────────────────────────────────────
-# PASO 2: CALCULO DE POs SECUENCIALES + INVENTARIO FINAL CONSTRAINT
+# STEP 3: PO PLAN + INVENTARIO FINAL (§3.4)
 # ─────────────────────────────────────────────
-
-
-def _compute_pos_and_final_inventory(
-    inv_teo: list[float],
-    demand: dict[int, float],
-    arrivals: dict[int, float],
-    projection_ids: list[int],
-    L: int,
-) -> tuple[list[dict], list[float]]:
-    """
-    Calcula POs secuenciales PO1..PO(L+1) y el inventario final Constraint 1..12.
-
-    Logica detallada:
-
-    1) PO1 (orden en t=1, llega en t=L+1):
-       R1 = inv_teo[L-1] - sum(SI_unc[L+1..2L]) + Arrivals[L+1]
-       Si R1 < 0: PO1 = |R1|, sino PO1 = 0.
-
-    2) Truncamiento unico permitido:
-       Despues de PO1, para t=0..L-1: si inv_teo[t] < 0 → forzar a 0.
-
-    3) Inventario real del periodo L+1:
-       inv_real[L] = inv_teo[L-1]_truncado - SI_unc[L+1] + Arrivals[L+1] + PO1
-
-    4) PO2..PO(L+1) secuenciales:
-       POk (k=2..L+1): orden en k, llega en k+L.
-       base = inv_real[periodo anterior], ventana = L meses de demanda.
-       Rk = base - ventana + Arrivals[llegada]. Si Rk < 0: POk = |Rk|.
-
-    5) Periodos restantes: inv_real[t] = inv_real[t-1] - SI[t] + Arrivals[t].
-
-    Returns:
-        Tupla de:
-        - Lista de dicts con POs: [{date_id_orden, date_id_llegada, unidades_po}]
-        - Lista de 12 floats: inventario final Constraint.
-          Periodos 1..L: truncados a 0 (pueden ser 0).
-          Periodos L+1..12: si negativo = error de proceso.
-    """
-    n = len(projection_ids)
-    pos: list[dict] = []
-    inv_final = [0.0] * n
-
-    # ── Paso 1: Calcular PO1 ──
-    po1_units = 0.0
-    if L < n:
-        base_po1 = inv_teo[L - 1]
-        demand_window_end = min(L + L, n)
-        demand_window = sum(
-            demand.get(projection_ids[j], 0.0)
-            for j in range(L, demand_window_end)
-        )
-        arrivals_at_arrival = arrivals.get(projection_ids[L], 0.0)
-        r1 = base_po1 - demand_window + arrivals_at_arrival
-
-        if r1 < -0.5:
-            po1_units = abs(r1)
-            pos.append({
-                "date_id_orden": projection_ids[0],
-                "date_id_llegada": projection_ids[L],
-                "unidades_po": round(po1_units, 4),
-            })
-
-    # ── Paso 2: Truncamiento permitido periodos 1..L ──
-    inv_teo_truncated = inv_teo.copy()
-    for t in range(min(L, n)):
-        if inv_teo_truncated[t] < 0:
-            inv_teo_truncated[t] = 0.0
-
-    # ── Paso 3: Inventario final periodos 1..L = truncado ──
-    for t in range(min(L, n)):
-        inv_final[t] = inv_teo_truncated[t]
-
-    # ── Paso 4: Inventario real periodo L+1 (post PO1) ──
-    if L < n:
-        did_arrival = projection_ids[L]
-        inv_final[L] = (
-            inv_teo_truncated[L - 1]
-            - demand.get(did_arrival, 0.0)
-            + arrivals.get(did_arrival, 0.0)
-            + po1_units
-        )
-
-    # ── Paso 5: PO2..PO(L+1) secuenciales ──
-    for k in range(2, L + 2):
-        arrival_idx = L + (k - 1)
-        order_idx = k - 1
-
-        if arrival_idx >= n:
-            break
-
-        base = inv_final[arrival_idx - 1]
-
-        demand_start_idx = arrival_idx
-        demand_end_idx = min(arrival_idx + L, n)
-        demand_window = sum(
-            demand.get(projection_ids[j], 0.0)
-            for j in range(demand_start_idx, demand_end_idx)
-        )
-
-        arrivals_at = arrivals.get(projection_ids[arrival_idx], 0.0)
-        rk = base - demand_window + arrivals_at
-
-        pok_units = 0.0
-        if rk < -0.5:
-            pok_units = abs(rk)
-            pos.append({
-                "date_id_orden": projection_ids[order_idx],
-                "date_id_llegada": projection_ids[arrival_idx],
-                "unidades_po": round(pok_units, 4),
-            })
-
-        did_arrival = projection_ids[arrival_idx]
-        inv_final[arrival_idx] = (
-            base
-            - demand.get(did_arrival, 0.0)
-            + arrivals.get(did_arrival, 0.0)
-            + pok_units
-        )
-
-    # ── Paso 6: Completar periodos restantes ──
-    last_calculated = min(L, n) - 1
-    if L < n:
-        last_calculated = L
-    for k in range(2, L + 2):
-        arrival_idx = L + (k - 1)
-        if arrival_idx < n:
-            last_calculated = max(last_calculated, arrival_idx)
-
-    for t in range(last_calculated + 1, n):
-        did = projection_ids[t]
-        inv_final[t] = (
-            inv_final[t - 1]
-            - demand.get(did, 0.0)
-            + arrivals.get(did, 0.0)
-        )
-
-    return pos, inv_final
 
 
 def generate_po_plan(
     session: Session,
     mes_cierre_date_id: int,
-) -> int:
+    inv_teo_all: dict[int, dict[int, float]],
+) -> tuple[int, dict[int, dict[int, float]]]:
     """
-    Genera POs internas por SKU + persiste inventario final Constraint 1..12.
+    Genera POs internas por SKU + calcula inventario final para 12 periodos.
 
-    Para cada SKU:
-    1. Calcula inventario teorico 1..12.
-    2. Calcula PO1..PO(L+1) con ventanas de L meses.
-    3. Persiste POs en fact_po_interno.
-    4. Persiste inventario final Constraint en fact_inventory_internal_constrained.
-       Periodos 1..L: truncados a 0 (permitido).
-       Periodos L+1..12: si negativo, reporta ERROR (no trunca).
+    Math (§3.4):
+    PO1 (order idx 0, arrives idx L):
+        S1 = sum SI_unc[L..L+3], clamped to < 12
+        R1 = inv_teo[L-1] - S1 + Arrivals[L]
+        PO1 = |R1| if R1 < 0, else 0
+
+    Post-PO1 truncation (§3.4 — ONLY allowed truncation):
+        For t = 0..L-1: if inv_teo[t] < 0 → set to 0
+
+    Chained inventory starting at period L:
+        inv[L] = inv_teo_truncated[L-1] - SI_unc[L] + Arrivals[L] + PO1
+
+    PO_k for k=2..5 (order idx k-1, arrives idx k-1+L):
+        base = inv[prev arrival idx]
+        demand_window = sum SI_unc[j] for j=(k-1+L)..(k-1+2L-1), clamped < 12
+        R_k = base - demand_window + Arrivals[k-1+L]
+        PO_k = |R_k| if R_k < 0, else 0
+
+    Continuation (after last PO arrival):
+        inv[t] = inv[t-1] - SI_unc[t] + Arrivals[t]
 
     Returns:
-        Numero de POs insertadas.
+        (po_count, inv_final_all) where inv_final_all = {sku_id: {date_id: inv_value}}
     """
     projection_ids = _get_projection_ids(mes_cierre_date_id)
-    sku_ids = _get_skus_with_demand(session, projection_ids)
+    n = len(projection_ids)  # always 12
 
-    # Limpiar POs previas y inventario constraint previo
+    # Delete existing POs
     session.query(FactPoInterno).delete(synchronize_session="fetch")
-    session.query(FactInventoryInternalConstrained).filter(
-        FactInventoryInternalConstrained.date_id.in_(projection_ids),
-    ).delete(synchronize_session="fetch")
 
     po_count = 0
-    inv_count = 0
-    negative_errors: list[dict] = []
+    inv_final_all: dict[int, dict[int, float]] = {}
 
-    for sku_id in sku_ids:
+    for sku_id, inv_teo_dict in inv_teo_all.items():
         L = _get_lead_time(session, sku_id)
-        inv_hist = _get_internal_inventory_initial(session, sku_id, mes_cierre_date_id)
         demand = _get_demand_by_month(session, sku_id, projection_ids)
         arrivals = _get_transit_arrivals_by_month(session, sku_id, projection_ids)
 
-        inv_teo = _compute_theoretical_inventory(
-            inv_hist, demand, arrivals, projection_ids
-        )
-        pos, inv_final = _compute_pos_and_final_inventory(
-            inv_teo, demand, arrivals, projection_ids, L
-        )
+        # Convert inv_teo dict to indexed list for easier manipulation
+        p = projection_ids  # shorthand
+        inv_teo = [inv_teo_dict.get(p[t], 0.0) for t in range(n)]
+        si_unc = [demand.get(p[t], 0.0) for t in range(n)]
+        arr = [arrivals.get(p[t], 0.0) for t in range(n)]
 
-        # Persistir POs
-        for po in pos:
+        inv_final = [0.0] * n
+        pos_for_sku: list[dict] = []
+
+        # ── PO1: order period 1 (idx 0), arrives period L+1 (idx L) ──
+        po1_units = 0.0
+        if L < n:
+            # §3.4: S1 = SI_unc for 4 months starting at arrival period
+            s1_end = min(L + L, n)  # §3.4: clamped to < 12
+            s1 = sum(si_unc[j] for j in range(L, s1_end))  # §3.4: demand window
+            r1 = inv_teo[L - 1] - s1 + arr[L]  # §3.4: R1 formula
+            if r1 < 0:
+                po1_units = abs(r1)  # §3.4: PO1 = |R1| if R1 < 0
+                pos_for_sku.append({
+                    "date_id_orden": p[0],
+                    "date_id_llegada": p[L],
+                    "unidades_po": round(po1_units, 4),
+                })
+
+        # ── Post-PO1 truncation: ONLY for periods 0..L-1 (§3.4) ──
+        inv_teo_trunc = inv_teo.copy()
+        for t in range(min(L, n)):
+            if inv_teo_trunc[t] < 0:
+                inv_teo_trunc[t] = 0.0  # §3.4: ONLY allowed truncation
+
+        # ── Store periods 1..L as truncated values ──
+        for t in range(min(L, n)):
+            inv_final[t] = inv_teo_trunc[t]
+
+        # ── Chained inventory at arrival of PO1 (idx L) ──
+        if L < n:
+            inv_final[L] = round(
+                inv_teo_trunc[L - 1] - si_unc[L] + arr[L] + po1_units, 4
+            )  # §3.4: chained inv formula
+
+        # ── PO_k for k=2..5 (order idx k-1, arrives idx k-1+L) ──
+        for k in range(2, 6):  # k=2,3,4,5
+            order_idx = k - 1
+            arrival_idx = k - 1 + L
+
+            if arrival_idx >= n:
+                break
+
+            base = inv_final[arrival_idx - 1]  # §3.4: base = inv[previous period]
+
+            # §3.4: demand window of L months starting at arrival
+            dw_start = arrival_idx
+            dw_end = min(arrival_idx + L, n)  # §3.4: clamped to < 12
+            demand_window = sum(si_unc[j] for j in range(dw_start, dw_end))
+
+            rk = base - demand_window + arr[arrival_idx]  # §3.4: R_k formula
+            pok_units = 0.0
+            if rk < 0:
+                pok_units = abs(rk)  # §3.4: PO_k = |R_k| if R_k < 0
+                pos_for_sku.append({
+                    "date_id_orden": p[order_idx],
+                    "date_id_llegada": p[arrival_idx],
+                    "unidades_po": round(pok_units, 4),
+                })
+
+            inv_final[arrival_idx] = round(
+                base - si_unc[arrival_idx] + arr[arrival_idx] + pok_units, 4
+            )  # §3.4: chained inv with PO
+
+        # ── Continuation (periods after last PO arrival) ──
+        # Determine last calculated index
+        last_calc = min(L, n) - 1  # truncated periods
+        if L < n:
+            last_calc = L  # PO1 arrival
+        for k in range(2, 6):
+            aidx = k - 1 + L
+            if aidx < n:
+                last_calc = max(last_calc, aidx)
+
+        for t in range(last_calc + 1, n):
+            inv_final[t] = round(
+                inv_final[t - 1] - si_unc[t] + arr[t], 4
+            )  # §3.4: continuation formula
+
+        # ── Persist POs ──
+        for po in pos_for_sku:
             session.add(FactPoInterno(
                 sku_id=sku_id,
                 date_id_orden=po["date_id_orden"],
@@ -404,93 +354,81 @@ def generate_po_plan(
             ))
             po_count += 1
 
-        # Persistir inventario final Constraint
-        for t in range(len(projection_ids)):
-            inv_val = inv_final[t]
-
-            # Periodos L+1..12: negativo = ERROR de proceso (no truncar)
-            if t >= L and inv_val < -0.5:
-                negative_errors.append({
-                    "sku_id": sku_id,
-                    "date_id": projection_ids[t],
-                    "periodo": t + 1,
-                    "inventario": round(inv_val, 4),
-                })
-                logger.error(
-                    "ERROR DE PROCESO: Inventario final Constraint negativo "
-                    "en periodo %d (date_id=%d) para SKU=%d: %.4f. "
-                    "Periodos L+1..12 no deben ser negativos.",
-                    t + 1, projection_ids[t], sku_id, inv_val,
-                )
-
-            session.add(FactInventoryInternalConstrained(
-                date_id=projection_ids[t],
-                sku_id=sku_id,
-                inventario_final_int=float(round(inv_val, 4)),
-            ))
-            inv_count += 1
+        # ── Store inv_final as dict ──
+        inv_final_all[sku_id] = {p[t]: inv_final[t] for t in range(n)}
 
     session.flush()
-
-    if negative_errors:
-        logger.error(
-            "generate_po_plan: %d periodos con inventario negativo (post-PO). "
-            "Detalle: %s",
-            len(negative_errors),
-            json.dumps(negative_errors[:20]),
-        )
-
     logger.info(
-        "generate_po_plan: %d POs generadas, %d registros inventario, "
-        "%d SKUs (%d errores inv negativo post-L)",
-        po_count, inv_count, len(sku_ids), len(negative_errors),
+        "generate_po_plan: %d POs generated for %d SKUs",
+        po_count, len(inv_teo_all),
     )
-    return po_count
+    return po_count, inv_final_all
 
 
 # ─────────────────────────────────────────────
-# FUNCIONES LEGACY (no-op, compatibilidad con orquestador)
+# STEP 4: REBUILD INTERNAL INVENTORY CONSTRAINED (§4)
 # ─────────────────────────────────────────────
-
-
-def simulate_internal_inventory_window(
-    session: Session,
-    mes_cierre_date_id: int,
-) -> int:
-    """No-op. Inventario teorico se calcula en memoria dentro de generate_po_plan."""
-    logger.info("simulate_internal_inventory_window: No-op (calculo en memoria).")
-    return 0
 
 
 def rebuild_internal_inventory_constrained(
     session: Session,
     mes_cierre_date_id: int,
+    inv_final_all: dict[int, dict[int, float]],
 ) -> int:
-    """No-op. Inventario Constraint ya persistido por generate_po_plan."""
+    """
+    Persiste inventario final Constraint 1..12 a DB.
+
+    Rules (§4):
+    - Periods 1..L (t < L): stored as truncated (max(val, 0.0)).
+    - Periods L+1..12 (t >= L): if val < -0.01 → raise ValueError (process ERROR).
+
+    Returns:
+        Count of records inserted.
+    """
     projection_ids = _get_projection_ids(mes_cierre_date_id)
-    count = (
-        session.query(FactInventoryInternalConstrained)
-        .filter(FactInventoryInternalConstrained.date_id.in_(projection_ids))
-        .count()
-    )
+
+    # Delete existing constrained inventory for projection periods
+    session.query(FactInventoryInternalConstrained).filter(
+        FactInventoryInternalConstrained.date_id.in_(projection_ids),
+    ).delete(synchronize_session="fetch")
+
+    count = 0
+
+    for sku_id, inv_dict in inv_final_all.items():
+        L = _get_lead_time(session, sku_id)
+
+        for t in range(len(projection_ids)):
+            did = projection_ids[t]
+            val = inv_dict.get(did, 0.0)
+
+            if t >= L and val < -0.01:
+                # §4: negative in L+1..12 = process ERROR. Do NOT clamp to 0.
+                raise ValueError(
+                    f"PROCESS ERROR: Negative constrained inventory in period "
+                    f"{t + 1} (date_id={did}) for SKU={sku_id}: {val:.4f}. "
+                    f"Periods L+1..12 must not be negative."
+                )
+
+            if t < L:
+                val = max(val, 0.0)  # §4: periods 1..L stored as truncated
+
+            session.add(FactInventoryInternalConstrained(
+                date_id=did,
+                sku_id=sku_id,
+                inventario_final_int=float(round(val, 4)),
+            ))
+            count += 1
+
+    session.flush()
     logger.info(
-        "rebuild_internal_inventory_constrained: %d registros ya presentes.", count
+        "rebuild_internal_inventory_constrained: %d records inserted for %d SKUs",
+        count, len(inv_final_all),
     )
     return count
 
 
 # ─────────────────────────────────────────────
-# PASO 4: SALES IN CONSTRAINED + LOST SALES
-# ─────────────────────────────────────────────
-#
-# Reglas clave (post-auditoria I1, I2):
-#   - Asignacion de inventario limitado: SECUENCIAL POR TAMAÑO.
-#     Se ordenan clientes de mayor a menor demanda SI_unc.
-#     Se llena cada cliente completo hasta agotar inventario.
-#     El ultimo cliente puede recibir asignacion parcial.
-#   - Sin cascada oos_triggered: cada mes se evalua independiente.
-#     Si hay llegadas de transito en un mes posterior, estas se
-#     suman al inv_running y pueden reabrir asignacion.
+# STEP 5: SALES IN CONSTRAINED + LOST SALES (§3.5)
 # ─────────────────────────────────────────────
 
 
@@ -499,45 +437,30 @@ def _allocate_sequential_by_size(
     available: float,
 ) -> list[tuple[int, float, float]]:
     """
-    Asigna inventario disponible a clientes de forma secuencial por tamaño.
+    Asigna inventario secuencial por tamaño (mayor a menor demanda).
 
-    Ordena clientes de mayor a menor demanda SI_unc.
-    Llena cada cliente completo hasta agotar inventario.
-    El ultimo cliente puede recibir parcial. Los restantes reciben 0.
-
-    Ejemplo (instrucciones originales):
-        Inventario = 60
-        Clientes: A=30, B=20, C=15, D=5 (total demanda = 70)
-        Resultado: A=30, B=20, C=10, D=0
-
-    Args:
-        entries: Lista de (cliente_id, demanda_si_unc).
-        available: Inventario disponible.
+    §3.5: Sort clients by demand DESC, give full demand until stock runs out.
 
     Returns:
-        Lista de (cliente_id, asignado, lost) para cada cliente.
+        List of (cliente_id, assigned, lost) for each client.
     """
     if available <= 0:
         return [(cid, 0.0, d) for cid, d in entries]
 
-    # Ordenar de mayor a menor demanda
-    sorted_entries = sorted(entries, key=lambda x: x[1], reverse=True)
+    sorted_entries = sorted(entries, key=lambda x: x[1], reverse=True)  # §3.5: sort DESC
 
     result: list[tuple[int, float, float]] = []
     remaining = available
 
     for cid, demand_c in sorted_entries:
         if remaining >= demand_c:
-            # Cliente completo
-            result.append((cid, demand_c, 0.0))
+            result.append((cid, demand_c, 0.0))  # §3.5: full demand
             remaining -= demand_c
         elif remaining > 0:
-            # Cliente parcial (ultimo con inventario)
-            result.append((cid, remaining, demand_c - remaining))
+            result.append((cid, remaining, demand_c - remaining))  # §3.5: partial
             remaining = 0.0
         else:
-            # Sin inventario
-            result.append((cid, 0.0, demand_c))
+            result.append((cid, 0.0, demand_c))  # §3.5: all lost
 
     return result
 
@@ -549,25 +472,21 @@ def compute_sales_in_constrained(
     """
     Calcula Sales In Constrained para todos los meses de proyeccion.
 
-    Logica:
-    - Periodos L+1..12: SI_constr = SI_unc (POs cubren la demanda).
+    Periods 1..L: each month evaluated INDEPENDENTLY with inv_running.
+        - §3.5 step 1: inv_running += Arrivals[t] (add only in month t, not pre-summed)
+        - Case A: inv_running >= demand_total → full demand
+        - Case B: 0 < inv_running < demand_total → sequential by size DESC
+        - Case C: inv_running <= 0 → all zero, all lost
 
-    - Periodos 1..L: cada mes se evalua INDEPENDIENTE con inv_running.
-        inv_running empieza en inv_hist.
-        Cada mes: inv_running += arrivals[t] (incluso si meses previos agotaron stock,
-        las llegadas de transito pueden reabrir asignacion).
-
-        Si inv_running >= demanda_total: SI_constr_c = SI_unc_c para todos.
-        Si 0 < inv_running < demanda_total: asignacion SECUENCIAL POR TAMAÑO.
-        Si inv_running <= 0: SI_constr = 0, todo es lost.
+    Periods L+1..12: SI_constr = SI_unc (copy directly).
 
     Returns:
-        dict con si_constrained_count, lost_sales_skus, total_lost_sales.
+        dict with si_constrained_count, lost_sales_skus, total_lost_sales.
     """
     projection_ids = _get_projection_ids(mes_cierre_date_id)
     sku_ids = _get_skus_with_demand(session, projection_ids)
 
-    # Limpiar datos previos
+    # Clean previous data
     session.query(FactSalesInConstrained).filter(
         FactSalesInConstrained.date_id.in_(projection_ids),
     ).delete(synchronize_session="fetch")
@@ -582,7 +501,7 @@ def compute_sales_in_constrained(
         inv_int_0 = _get_internal_inventory_initial(session, sku_id, mes_cierre_date_id)
         arrivals = _get_transit_arrivals_by_month(session, sku_id, projection_ids)
 
-        # Obtener demanda por cliente-SKU-mes
+        # Get demand by client-SKU-month
         si_unc_rows = (
             session.query(
                 FactSalesInUnconstrained.date_id,
@@ -596,14 +515,14 @@ def compute_sales_in_constrained(
             .all()
         )
 
-        # Organizar: {date_id: [(cliente_id, demanda), ...]}
+        # Organize: {date_id: [(cliente_id, demand), ...]}
         demand_by_month_client: dict[int, list[tuple[int, float]]] = {}
         for r in si_unc_rows:
             demand_by_month_client.setdefault(r.date_id, []).append(
                 (r.cliente_id, float(r.unidades_sales_in_unc or 0))
             )
 
-        # ── Inventario running progresivo, mes a mes, SIN cascada ──
+        # §3.5: inv_running starts at inv_hist
         inv_running = inv_int_0
         lost_by_month: dict[int, float] = {}
 
@@ -612,15 +531,13 @@ def compute_sales_in_constrained(
             is_lt_window = t < L
 
             if is_lt_window:
-                # Sumar llegadas de transito de este mes
-                # (I2: siempre se suman, incluso si meses previos agotaron stock)
+                # §3.5 step 1: add arrivals for THIS month only (not pre-summed)
                 inv_running += arrivals.get(date_id_t, 0.0)
 
                 month_entries = demand_by_month_client.get(date_id_t, [])
                 demand_total = sum(d for _, d in month_entries)
 
                 if demand_total <= 0:
-                    # Sin demanda: insertar 0 para cada cliente
                     for cid, d_ct in month_entries:
                         session.add(FactSalesInConstrained(
                             date_id=date_id_t,
@@ -632,7 +549,7 @@ def compute_sales_in_constrained(
                     continue
 
                 if inv_running >= demand_total:
-                    # Stock suficiente: constrained = unconstrained
+                    # §3.5 Case A: full demand for all clients
                     for cid, d_ct in month_entries:
                         session.add(FactSalesInConstrained(
                             date_id=date_id_t,
@@ -644,7 +561,7 @@ def compute_sales_in_constrained(
                     inv_running -= demand_total
 
                 elif inv_running > 0:
-                    # Stock parcial: ASIGNACION SECUENCIAL POR TAMAÑO (I1)
+                    # §3.5 Case B: sequential by size DESC
                     allocation = _allocate_sequential_by_size(
                         month_entries, inv_running
                     )
@@ -662,11 +579,10 @@ def compute_sales_in_constrained(
 
                     lost_by_month[date_id_t] = lost_this_month
                     inv_running = 0.0
-                    # I2: NO se activa oos_triggered. El proximo mes se evalua
-                    # independiente con su inv_running (que puede recibir arrivals).
+                    # §3.5: NO oos_triggered cascade
 
                 else:
-                    # inv_running <= 0: todo es lost para este mes
+                    # §3.5 Case C: inv_running <= 0, all lost
                     for cid, d_ct in month_entries:
                         session.add(FactSalesInConstrained(
                             date_id=date_id_t,
@@ -676,10 +592,10 @@ def compute_sales_in_constrained(
                         ))
                         si_count += 1
                     lost_by_month[date_id_t] = demand_total
-                    # I2: NO cascade. Siguiente mes se evalua con su inv_running.
+                    # §3.5: inv_running unchanged, carries to next month
 
             else:
-                # Meses L+1..12: Constrained = Unconstrained
+                # §3.5: Periods L+1..12: SI_constr = SI_unc (copy directly)
                 for cid, d_ct in demand_by_month_client.get(date_id_t, []):
                     session.add(FactSalesInConstrained(
                         date_id=date_id_t,
@@ -689,7 +605,7 @@ def compute_sales_in_constrained(
                     ))
                     si_count += 1
 
-        # ── Insertar reporte de Lost Sales ──
+        # Insert lost sales report
         total_lost_sku = sum(lost_by_month.values())
         if total_lost_sku > 0:
             lt_window_end = min(L, len(projection_ids)) - 1
@@ -708,8 +624,8 @@ def compute_sales_in_constrained(
 
     session.flush()
     logger.info(
-        "compute_sales_in_constrained: %d registros SI constrained, "
-        "%d SKUs con lost sales (total: %.0f unidades)",
+        "compute_sales_in_constrained: %d SI constrained records, "
+        "%d SKUs with lost sales (total: %.0f units)",
         si_count, lost_count, total_lost,
     )
     return {
@@ -720,41 +636,25 @@ def compute_sales_in_constrained(
 
 
 # ─────────────────────────────────────────────
-# PASO 5: REPORTE DE ASIGNACION EDITABLE (GATE BLOQUEANTE)
+# STEP 7: GATE — ALLOCATION REPORT GENERATION
 # ─────────────────────────────────────────────
 
 
 def generate_allocation_report(
     session: Session,
     mes_cierre_date_id: int,
-) -> int:
+) -> list[dict]:
     """
-    Genera el reporte de asignacion de inventario limitado para los periodos
-    1..L de la proyeccion.
+    For periods 1..L, query SI_unc and SI_constr, join with DimSku and DimCliente.
 
-    Para cada combinacion (sku_id, cliente_id, date_id) en la ventana 1..L:
-    - si_unconstrained = valor de FactSalesInUnconstrained.
-    - si_constrained_auto = valor de FactSalesInConstrained.
-    - si_constrained_usuario = NULL (pendiente de aprobacion).
-    - aprobado = False.
-
-    Este reporte es el gate bloqueante: el usuario debe revisarlo y aprobarlo
-    antes de que se ejecute Fase B (Sales Out Constraint).
-
-    Args:
-        session: Sesion de SQLAlchemy activa.
-        mes_cierre_date_id: date_id del ultimo mes historico (YYYYMM).
-
-    Returns:
-        Numero de registros insertados en rpt_asignacion_inventario.
+    Returns list of:
+        {sku_id, upc, sku_descripcion, cliente_id, cliente_nombre,
+         date_id, si_unc, asignacion, lost_sales}
     """
     projection_ids = _get_projection_ids(mes_cierre_date_id)
     sku_ids = _get_skus_with_demand(session, projection_ids)
 
-    # Limpiar reporte previo
-    session.query(RptAsignacionInventario).delete(synchronize_session="fetch")
-
-    # Pre-cargar SI Unconstrained: {(sku_id, cliente_id, date_id): unidades}
+    # Pre-load SI Unconstrained
     si_unc_rows = (
         session.query(
             FactSalesInUnconstrained.sku_id,
@@ -771,7 +671,7 @@ def generate_allocation_report(
             r.unidades_sales_in_unc or 0
         )
 
-    # Pre-cargar SI Constrained: {(sku_id, cliente_id, date_id): unidades}
+    # Pre-load SI Constrained
     si_constr_rows = (
         session.query(
             FactSalesInConstrained.sku_id,
@@ -788,50 +688,185 @@ def generate_allocation_report(
             r.unidades_sales_in_constr or 0
         )
 
-    inserted = 0
+    # Pre-load SKU info
+    sku_info = {}
+    for s in session.query(DimSku).filter(DimSku.sku_id.in_(sku_ids)).all():
+        sku_info[s.sku_id] = {"upc": s.upc, "descripcion": s.sku_descripcion}
+
+    # Pre-load client names
+    client_names = {}
+    for c in session.query(DimCliente).all():
+        client_names[c.cliente_id] = c.cliente_nombre
+
+    result: list[dict] = []
 
     for sku_id in sku_ids:
         L = _get_lead_time(session, sku_id)
-        lt_ids = projection_ids[:L]  # periodos 1..L
+        lt_ids = projection_ids[:L]
+        info = sku_info.get(sku_id, {"upc": None, "descripcion": None})
 
-        for t, date_id_t in enumerate(lt_ids):
-            # Obtener todos los clientes con demanda para este SKU+periodo
-            clients_unc = [
+        for date_id_t in lt_ids:
+            clients = [
                 (key[1], val)
                 for key, val in si_unc_lookup.items()
                 if key[0] == sku_id and key[2] == date_id_t
             ]
 
-            for cliente_id, si_unc_val in clients_unc:
+            for cliente_id, si_unc_val in clients:
                 si_constr_val = si_constr_lookup.get(
                     (sku_id, cliente_id, date_id_t), 0.0
                 )
+                lost = round(si_unc_val - si_constr_val, 4)
 
-                session.add(
-                    RptAsignacionInventario(
-                        sku_id=sku_id,
-                        cliente_id=cliente_id,
-                        date_id=date_id_t,
-                        periodo_proyeccion=t + 1,
-                        si_unconstrained=float(round(si_unc_val, 4)),
-                        si_constrained_auto=float(round(si_constr_val, 4)),
-                        si_constrained_usuario=None,
-                        aprobado=False,
-                    )
-                )
-                inserted += 1
+                result.append({
+                    "sku_id": sku_id,
+                    "upc": int(info["upc"]) if info["upc"] else None,
+                    "sku_descripcion": info["descripcion"],
+                    "cliente_id": cliente_id,
+                    "cliente_nombre": client_names.get(cliente_id, f"CLIENTE_{cliente_id}"),
+                    "date_id": date_id_t,
+                    "si_unc": round(si_unc_val, 4),
+                    "asignacion": round(si_constr_val, 4),
+                    "lost_sales": max(lost, 0.0),
+                })
 
-    session.flush()
     logger.info(
-        "generate_allocation_report: %d registros para %d SKUs",
-        inserted,
-        len(sku_ids),
+        "generate_allocation_report: %d rows for %d SKUs", len(result), len(sku_ids)
     )
-    return inserted
+    return result
 
 
 # ─────────────────────────────────────────────
-# ORQUESTADOR DE FASE 3 (firma publica sin cambios)
+# STEP 8: GATE — VALIDATION (§6)
+# ─────────────────────────────────────────────
+
+
+def validate_allocation_edits(
+    session: Session,
+    mes_cierre_date_id: int,
+    edits: list[dict],
+) -> dict:
+    """
+    Validation rule (§6): For each SKU and each period t (1..L):
+        cumulative_assigned(SKU, t) = sum over k=1..t, all clients: Asignacion[SKU, client, period_k]
+        cumulative_available(SKU, t) = inv_hist(SKU) + sum over k=1..t: Arrivals[SKU, period_k]
+        cumulative_assigned(SKU, t) <= cumulative_available(SKU, t)
+
+    Merges edits with existing FactSalesInConstrained values.
+
+    Returns:
+        {"valid": True} or {"valid": False, "errors": [...]}
+    """
+    projection_ids = _get_projection_ids(mes_cierre_date_id)
+
+    # Load existing SI constrained
+    si_constr_rows = (
+        session.query(
+            FactSalesInConstrained.sku_id,
+            FactSalesInConstrained.cliente_id,
+            FactSalesInConstrained.date_id,
+            FactSalesInConstrained.unidades_sales_in_constr,
+        )
+        .filter(FactSalesInConstrained.date_id.in_(projection_ids))
+        .all()
+    )
+    # Build lookup: {(sku_id, cliente_id, date_id): value}
+    current_vals: dict[tuple[int, int, int], float] = {
+        (r.sku_id, r.cliente_id, r.date_id): float(r.unidades_sales_in_constr or 0)
+        for r in si_constr_rows
+    }
+
+    # Apply edits as overrides
+    for edit in edits:
+        key = (edit["sku_id"], edit["cliente_id"], edit["date_id"])
+        current_vals[key] = float(edit["new_asignacion"])
+
+    # Get all SKUs involved
+    sku_ids = set(k[0] for k in current_vals.keys())
+
+    errors: list[str] = []
+
+    for sku_id in sorted(sku_ids):
+        L = _get_lead_time(session, sku_id)
+        lt_ids = projection_ids[:L]
+
+        inv_hist = _get_internal_inventory_initial(session, sku_id, mes_cierre_date_id)
+        arrivals = _get_transit_arrivals_by_month(session, sku_id, projection_ids)
+
+        cum_assigned = 0.0
+        cum_available = inv_hist
+
+        for t, did in enumerate(lt_ids):
+            # §6: cumulative arrivals
+            cum_available += arrivals.get(did, 0.0)
+
+            # §6: cumulative assigned (all clients for this SKU and period)
+            period_assigned = sum(
+                v for (sid, cid, d), v in current_vals.items()
+                if sid == sku_id and d == did
+            )
+            cum_assigned += period_assigned
+
+            if cum_assigned > cum_available + 0.01:  # rounding tolerance
+                errors.append(
+                    f"SKU {sku_id} period {t + 1} (date_id={did}): "
+                    f"assigned {cum_assigned:.4f} > available {cum_available:.4f}"
+                )
+
+    if errors:
+        return {"valid": False, "errors": errors}
+    return {"valid": True}
+
+
+# ─────────────────────────────────────────────
+# STEP 9: GATE — APPLY APPROVED EDITS
+# ─────────────────────────────────────────────
+
+
+def apply_approved_allocation(
+    session: Session,
+    mes_cierre_date_id: int,
+    edits: list[dict] | None = None,
+) -> dict:
+    """
+    If edits is not None: update matching FactSalesInConstrained rows
+    (match on sku_id + cliente_id + date_id). If no matching row exists, insert.
+
+    Returns:
+        {"estado": "APROBADO", "registros_modificados": int}
+    """
+    modified = 0
+
+    if edits is not None:
+        for edit in edits:
+            row = (
+                session.query(FactSalesInConstrained)
+                .filter(
+                    FactSalesInConstrained.sku_id == edit["sku_id"],
+                    FactSalesInConstrained.cliente_id == edit["cliente_id"],
+                    FactSalesInConstrained.date_id == edit["date_id"],
+                )
+                .first()
+            )
+            if row:
+                row.unidades_sales_in_constr = float(round(edit["new_asignacion"], 4))
+            else:
+                session.add(FactSalesInConstrained(
+                    date_id=edit["date_id"],
+                    cliente_id=edit["cliente_id"],
+                    sku_id=edit["sku_id"],
+                    unidades_sales_in_constr=float(round(edit["new_asignacion"], 4)),
+                ))
+            modified += 1
+
+        session.flush()
+
+    logger.info("apply_approved_allocation: %d records modified", modified)
+    return {"estado": "APROBADO", "registros_modificados": modified}
+
+
+# ─────────────────────────────────────────────
+# STEP 6: ORCHESTRATOR (no commit inside)
 # ─────────────────────────────────────────────
 
 
@@ -840,24 +875,22 @@ def run_constraint_process(
     mes_cierre_date_id: int,
 ) -> dict:
     """
-    Fase 3: Constraint Demand para un mes de cierre dado.
+    Fase 3: Constraint Demand for a given close month.
 
-    Pre-condiciones:
-    - Fase 2 (Unconstrained Demand) ya ejecutada.
-    - Inventario interno e inventario en transito cargados.
+    Pre-conditions:
+    - Fase 2 (Unconstrained Demand) already executed.
+    - Internal and transit inventory loaded.
 
-    Pasos:
-    1) [No-op] Inventario teorico en memoria.
-    2) Generar POs secuenciales + persistir inventario Constraint 1..12.
-    3) [No-op] Inventario ya en paso 2.
-    4) Calcular Sales In Constrained (secuencial por tamaño) + Lost Sales.
+    Steps:
+    1. Theoretical inventory (in-memory).
+    2. PO plan + final inventory.
+    3. Persist constrained internal inventory.
+    4. Sales In Constrained.
 
-    NOTA: Despues de este proceso, se debe generar el reporte de asignacion
-    editable y esperar aprobacion del usuario antes de ejecutar Fase B
-    (Sales Out Constraint).
+    NOTE: No session.commit() — only the API endpoint commits.
 
     Returns:
-        dict con resumen del proceso.
+        dict with process summary.
     """
     start_time = datetime.now()
     summary = {
@@ -867,50 +900,41 @@ def run_constraint_process(
         "pasos": {},
     }
 
-    try:
-        # Paso 1: [No-op]
-        logger.info("Constraint Paso 1: Inventario teorico (en memoria, no-op)...")
-        sim_count = simulate_internal_inventory_window(session, mes_cierre_date_id)
-        summary["pasos"]["1_simulacion_lt"] = {"registros": sim_count}
+    # Step 1: theoretical inventory (in-memory)
+    logger.info("Constraint Step 1: Theoretical inventory...")
+    inv_teo_all = compute_theoretical_inventory(session, mes_cierre_date_id)
+    summary["pasos"]["1_inventario_teorico"] = {"skus": len(inv_teo_all)}
 
-        # Paso 2: POs + inventario Constraint
-        logger.info("Constraint Paso 2: POs secuenciales + inventario Constraint...")
-        po_count = generate_po_plan(session, mes_cierre_date_id)
-        summary["pasos"]["2_pos_generadas"] = {"pos": po_count}
+    # Step 2: PO plan + final inventory
+    logger.info("Constraint Step 2: PO plan + final inventory...")
+    po_count, inv_final_all = generate_po_plan(
+        session, mes_cierre_date_id, inv_teo_all
+    )
+    summary["pasos"]["2_pos_generadas"] = {"pos": po_count}
 
-        # Paso 3: [No-op]
-        logger.info("Constraint Paso 3: Inventario (ya en paso 2)...")
-        inv_count = rebuild_internal_inventory_constrained(session, mes_cierre_date_id)
-        summary["pasos"]["3_inventario_reconstruido"] = {"registros": inv_count}
+    # Step 3: persist constrained internal inventory
+    logger.info("Constraint Step 3: Persist constrained internal inventory...")
+    inv_count = rebuild_internal_inventory_constrained(
+        session, mes_cierre_date_id, inv_final_all
+    )
+    summary["pasos"]["3_inventario_constrained"] = {"registros": inv_count}
 
-        # Paso 4: Sales In Constrained + Lost Sales
-        logger.info("Constraint Paso 4: Sales In Constrained (secuencial) + Lost Sales...")
-        constr_result = compute_sales_in_constrained(session, mes_cierre_date_id)
-        summary["pasos"]["4_sales_in_constrained"] = constr_result
+    # Step 4: Sales In Constrained
+    logger.info("Constraint Step 4: Sales In Constrained...")
+    constr_result = compute_sales_in_constrained(session, mes_cierre_date_id)
+    summary["pasos"]["4_sales_in_constrained"] = constr_result
 
-        # Paso 5: Reporte de asignacion editable (gate bloqueante)
-        logger.info("Constraint Paso 5: Generando reporte de asignacion...")
-        alloc_count = generate_allocation_report(session, mes_cierre_date_id)
-        summary["pasos"]["5_reporte_asignacion"] = {"registros": alloc_count}
+    session.flush()  # §: no commit
 
-        summary["estado"] = "COMPLETADO_PENDIENTE_APROBACION"
-        summary["mensaje"] = (
-            f"Constraint Demand Fase A completado. "
-            f"{po_count} POs generadas, "
-            f"{constr_result['lost_sales_skus']} SKUs con lost sales "
-            f"(total: {constr_result['total_lost_sales']:,.0f} unidades). "
-            f"PENDIENTE: Aprobacion de reporte de asignacion antes de Fase B."
-        )
-        summary["duracion_segundos"] = (datetime.now() - start_time).total_seconds()
+    summary["estado"] = "COMPLETADO_PENDIENTE_APROBACION"
+    summary["mensaje"] = (
+        f"Phase A done. Gate approval required before Phase B. "
+        f"{po_count} POs, {constr_result['lost_sales_skus']} SKUs with lost sales "
+        f"(total: {constr_result['total_lost_sales']:,.0f} units)."
+    )
+    summary["duracion_segundos"] = (datetime.now() - start_time).total_seconds()
 
-        session.commit()
-        logger.info("run_constraint_process completado para mes %d", mes_cierre_date_id)
-        return summary
-
-    except Exception as e:
-        session.rollback()
-        summary["estado"] = "ERROR"
-        summary["mensaje"] = f"Error en Constraint Demand: {str(e)}"
-        summary["duracion_segundos"] = (datetime.now() - start_time).total_seconds()
-        logger.exception("Error en run_constraint_process para mes %d", mes_cierre_date_id)
-        raise
+    logger.info(
+        "run_constraint_process completed for month %d", mes_cierre_date_id
+    )
+    return summary

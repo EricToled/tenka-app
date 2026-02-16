@@ -362,6 +362,7 @@ class FactInventoryInternalConstrained(Base):
     date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
     sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
     inventario_final_int = Column(Numeric(18, 4), nullable=False)
+    days_of_sale_int_constr = Column(Numeric(18, 4))
 
     tiempo = relationship("DimTiempo", lazy="joined")
     sku = relationship("DimSku", lazy="joined")
@@ -395,38 +396,14 @@ class RptLostSalesOos(Base):
 
 
 # ─────────────────────────────────────────────
-# FASE B: REPORTE DE ASIGNACION + SO CONSTRAINED + INV CLIENTE CONSTRAINED
+# FASE B+C: SO CONSTRAINED + INV CLIENTE CONSTRAINED
 # ─────────────────────────────────────────────
 
 
-class RptAsignacionInventario(Base):
-    """Reporte editable de asignacion de inventario limitado (gate bloqueante)."""
-
-    __tablename__ = "rpt_asignacion_inventario"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
-    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    periodo_proyeccion = Column(Integer, nullable=False)  # 1, 2, 3 o 4
-    si_unconstrained = Column(Numeric(18, 4), nullable=False)
-    si_constrained_auto = Column(Numeric(18, 4), nullable=False)
-    si_constrained_usuario = Column(Numeric(18, 4))  # NULL hasta aprobacion
-    aprobado = Column(Boolean, default=False)
-    fecha_creacion = Column(DateTime, server_default=func.now())
-    fecha_aprobacion = Column(DateTime)
-
-    sku = relationship("DimSku", lazy="joined")
-    cliente = relationship("DimCliente", lazy="joined")
-    tiempo = relationship("DimTiempo", lazy="joined")
-
-
 class FactSalesOutConstrained(Base):
-    """Sales Out Constrained por cliente-SKU-periodo."""
-
     __tablename__ = "fact_sales_out_constrained"
 
-    fact_sales_out_constr_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    fact_so_constr_id = Column(BigInteger, primary_key=True, autoincrement=True)
     date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
     cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
     sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
@@ -437,94 +414,16 @@ class FactSalesOutConstrained(Base):
     sku = relationship("DimSku", lazy="joined")
 
 
-class FactInventoryClientConstrained(Base):
-    """Inventario final del cliente Constrained por cliente-SKU-periodo."""
-
-    __tablename__ = "fact_inventory_client_constrained"
+class FactInventoryClienteConstrained(Base):
+    __tablename__ = "fact_inventory_cliente_constrained"
 
     fact_inv_cli_constr_id = Column(BigInteger, primary_key=True, autoincrement=True)
     date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
     cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
     sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    inventario_final_constr = Column(Numeric(18, 4), nullable=False)
+    inventario_final_cliente_constr = Column(Numeric(18, 4), nullable=False)
+    days_of_sale_cli_constr = Column(Numeric(18, 4))
 
     tiempo = relationship("DimTiempo", lazy="joined")
     cliente = relationship("DimCliente", lazy="joined")
-    sku = relationship("DimSku", lazy="joined")
-
-
-# ─────────────────────────────────────────────
-# FASE C: REPORTES VENTAS PERDIDAS + DOS CONSTRAINT
-# ─────────────────────────────────────────────
-
-
-class RptLostSalesSalesOut(Base):
-    """Reporte de ventas perdidas Sales Out (SO_unc - SO_constr) periodos 1..L."""
-
-    __tablename__ = "rpt_lost_sales_sales_out"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
-    sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    periodo_proyeccion = Column(Integer, nullable=False)  # 1..4
-    so_unconstrained = Column(Numeric(18, 4), nullable=False)
-    so_constrained = Column(Numeric(18, 4), nullable=False)
-    lost_sales = Column(Numeric(18, 4), nullable=False)  # so_unc - so_constr
-
-    cliente = relationship("DimCliente", lazy="joined")
-    sku = relationship("DimSku", lazy="joined")
-
-
-class RptLostSalesSalesIn(Base):
-    """Reporte de ventas perdidas Sales In (SI_unc - SI_constr) periodos 1..L."""
-
-    __tablename__ = "rpt_lost_sales_sales_in"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
-    sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    periodo_proyeccion = Column(Integer, nullable=False)  # 1..4
-    si_unconstrained = Column(Numeric(18, 4), nullable=False)
-    si_constrained = Column(Numeric(18, 4), nullable=False)
-    lost_sales = Column(Numeric(18, 4), nullable=False)  # si_unc - si_constr
-
-    cliente = relationship("DimCliente", lazy="joined")
-    sku = relationship("DimSku", lazy="joined")
-
-
-class FactDosConstraintCliente(Base):
-    """DOS Constraint a nivel cliente-SKU-periodo."""
-
-    __tablename__ = "fact_dos_constraint_cliente"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
-    sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    inventario_final_constr = Column(Numeric(18, 4), nullable=False)
-    promedio_ventas_12m = Column(Numeric(18, 4))
-    months_of_sale_constr = Column(Numeric(18, 4))
-    days_of_sale_constr = Column(Numeric(18, 4))
-
-    tiempo = relationship("DimTiempo", lazy="joined")
-    cliente = relationship("DimCliente", lazy="joined")
-    sku = relationship("DimSku", lazy="joined")
-
-
-class FactDosConstraintInterno(Base):
-    """DOS Constraint interno a nivel SKU-periodo."""
-
-    __tablename__ = "fact_dos_constraint_interno"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    inventario_final_int_constr = Column(Numeric(18, 4), nullable=False)
-    promedio_ventas_12m = Column(Numeric(18, 4))
-    months_of_sale_constr = Column(Numeric(18, 4))
-    days_of_sale_constr = Column(Numeric(18, 4))
-
-    tiempo = relationship("DimTiempo", lazy="joined")
     sku = relationship("DimSku", lazy="joined")
