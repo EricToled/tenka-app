@@ -40,7 +40,7 @@ from .models import (
     FactInventoryClienteConstrained,
     RptLostSalesOos,
 )
-from .monthly_close import _compute_month_minus_n
+from .monthly_close import _compute_month_minus_n, _compute_month_plus_n
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +48,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-
-
-def _compute_month_plus_n(date_id: int, n: int) -> int:
-    """Avanza n meses desde date_id (YYYYMM)."""
-    anio = date_id // 100
-    mes = date_id % 100
-    total_months = (anio * 12 + mes - 1) + n
-    new_anio = total_months // 12
-    new_mes = total_months % 12 + 1
-    return new_anio * 100 + new_mes
 
 
 def _get_projection_ids(mes_cierre_date_id: int) -> list[int]:

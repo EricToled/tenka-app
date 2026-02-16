@@ -107,6 +107,10 @@ app.add_middleware(
 from .api_frontend import router as frontend_router  # noqa: E402
 app.include_router(frontend_router)
 
+# Registrar endpoints del wizard de cierre de mes
+from .cierre_mes_workflow import router as cierre_router  # noqa: E402
+app.include_router(cierre_router)
+
 
 # ─────────────────────────────────────────────
 # Helpers

@@ -1,11 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { BarChart3, CalendarCheck, UserPlus, Settings } from 'lucide-react'
+import { BarChart3, CalendarCheck, UserPlus, Settings, ClipboardList } from 'lucide-react'
 
 const links = [
-  { to: '/reportes', label: 'Reportes', icon: BarChart3 },
-  { to: '/cierre', label: 'Cierre de mes', icon: CalendarCheck },
-  { to: '/altas-bajas', label: 'Altas, bajas y mod.', icon: UserPlus },
-  { to: '/configuracion', label: 'Configuracion', icon: Settings },
+  { to: '/cierre',        label: 'Cierre de mes',       icon: CalendarCheck },
+  { to: '/reportes',      label: 'Reportes',            icon: BarChart3 },
+  { to: '/altas-bajas',   label: 'Altas, bajas y mod.', icon: UserPlus },
+  { to: '/constraint',    label: 'Constraint Demand',   icon: ClipboardList },
+  { to: '/configuracion', label: 'Configuracion',       icon: Settings },
 ]
 
 export default function Sidebar() {
