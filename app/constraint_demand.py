@@ -48,6 +48,7 @@ from .models import (
     FactPoInterno,
     FactSalesInConstrained,
     FactSalesInUnconstrained,
+    RptAsignacionInventario,
     RptLostSalesOos,
 )
 from .monthly_close import _compute_month_minus_n
@@ -719,6 +720,117 @@ def compute_sales_in_constrained(
 
 
 # ─────────────────────────────────────────────
+# PASO 5: REPORTE DE ASIGNACION EDITABLE (GATE BLOQUEANTE)
+# ─────────────────────────────────────────────
+
+
+def generate_allocation_report(
+    session: Session,
+    mes_cierre_date_id: int,
+) -> int:
+    """
+    Genera el reporte de asignacion de inventario limitado para los periodos
+    1..L de la proyeccion.
+
+    Para cada combinacion (sku_id, cliente_id, date_id) en la ventana 1..L:
+    - si_unconstrained = valor de FactSalesInUnconstrained.
+    - si_constrained_auto = valor de FactSalesInConstrained.
+    - si_constrained_usuario = NULL (pendiente de aprobacion).
+    - aprobado = False.
+
+    Este reporte es el gate bloqueante: el usuario debe revisarlo y aprobarlo
+    antes de que se ejecute Fase B (Sales Out Constraint).
+
+    Args:
+        session: Sesion de SQLAlchemy activa.
+        mes_cierre_date_id: date_id del ultimo mes historico (YYYYMM).
+
+    Returns:
+        Numero de registros insertados en rpt_asignacion_inventario.
+    """
+    projection_ids = _get_projection_ids(mes_cierre_date_id)
+    sku_ids = _get_skus_with_demand(session, projection_ids)
+
+    # Limpiar reporte previo
+    session.query(RptAsignacionInventario).delete(synchronize_session="fetch")
+
+    # Pre-cargar SI Unconstrained: {(sku_id, cliente_id, date_id): unidades}
+    si_unc_rows = (
+        session.query(
+            FactSalesInUnconstrained.sku_id,
+            FactSalesInUnconstrained.cliente_id,
+            FactSalesInUnconstrained.date_id,
+            FactSalesInUnconstrained.unidades_sales_in_unc,
+        )
+        .filter(FactSalesInUnconstrained.date_id.in_(projection_ids))
+        .all()
+    )
+    si_unc_lookup: dict[tuple[int, int, int], float] = {}
+    for r in si_unc_rows:
+        si_unc_lookup[(r.sku_id, r.cliente_id, r.date_id)] = float(
+            r.unidades_sales_in_unc or 0
+        )
+
+    # Pre-cargar SI Constrained: {(sku_id, cliente_id, date_id): unidades}
+    si_constr_rows = (
+        session.query(
+            FactSalesInConstrained.sku_id,
+            FactSalesInConstrained.cliente_id,
+            FactSalesInConstrained.date_id,
+            FactSalesInConstrained.unidades_sales_in_constr,
+        )
+        .filter(FactSalesInConstrained.date_id.in_(projection_ids))
+        .all()
+    )
+    si_constr_lookup: dict[tuple[int, int, int], float] = {}
+    for r in si_constr_rows:
+        si_constr_lookup[(r.sku_id, r.cliente_id, r.date_id)] = float(
+            r.unidades_sales_in_constr or 0
+        )
+
+    inserted = 0
+
+    for sku_id in sku_ids:
+        L = _get_lead_time(session, sku_id)
+        lt_ids = projection_ids[:L]  # periodos 1..L
+
+        for t, date_id_t in enumerate(lt_ids):
+            # Obtener todos los clientes con demanda para este SKU+periodo
+            clients_unc = [
+                (key[1], val)
+                for key, val in si_unc_lookup.items()
+                if key[0] == sku_id and key[2] == date_id_t
+            ]
+
+            for cliente_id, si_unc_val in clients_unc:
+                si_constr_val = si_constr_lookup.get(
+                    (sku_id, cliente_id, date_id_t), 0.0
+                )
+
+                session.add(
+                    RptAsignacionInventario(
+                        sku_id=sku_id,
+                        cliente_id=cliente_id,
+                        date_id=date_id_t,
+                        periodo_proyeccion=t + 1,
+                        si_unconstrained=float(round(si_unc_val, 4)),
+                        si_constrained_auto=float(round(si_constr_val, 4)),
+                        si_constrained_usuario=None,
+                        aprobado=False,
+                    )
+                )
+                inserted += 1
+
+    session.flush()
+    logger.info(
+        "generate_allocation_report: %d registros para %d SKUs",
+        inserted,
+        len(sku_ids),
+    )
+    return inserted
+
+
+# ─────────────────────────────────────────────
 # ORQUESTADOR DE FASE 3 (firma publica sin cambios)
 # ─────────────────────────────────────────────
 
@@ -775,6 +887,11 @@ def run_constraint_process(
         logger.info("Constraint Paso 4: Sales In Constrained (secuencial) + Lost Sales...")
         constr_result = compute_sales_in_constrained(session, mes_cierre_date_id)
         summary["pasos"]["4_sales_in_constrained"] = constr_result
+
+        # Paso 5: Reporte de asignacion editable (gate bloqueante)
+        logger.info("Constraint Paso 5: Generando reporte de asignacion...")
+        alloc_count = generate_allocation_report(session, mes_cierre_date_id)
+        summary["pasos"]["5_reporte_asignacion"] = {"registros": alloc_count}
 
         summary["estado"] = "COMPLETADO_PENDIENTE_APROBACION"
         summary["mensaje"] = (
