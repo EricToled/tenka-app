@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from .eligibility import _generate_date_id_range
 from .models import (
+    ConstraintProcessControl,
     DimCliente,
     DimSku,
     FactInventarioInterno,
@@ -524,7 +525,7 @@ def compute_sales_in_constrained(
 
         # §3.5: inv_running starts at inv_hist
         inv_running = inv_int_0
-        lost_by_month: dict[int, float] = {}
+        lost_records: list[tuple[int, int, float]] = []  # (cliente_id, date_id, lost_units)
 
         for t in range(len(projection_ids)):
             date_id_t = projection_ids[t]
@@ -565,7 +566,6 @@ def compute_sales_in_constrained(
                     allocation = _allocate_sequential_by_size(
                         month_entries, inv_running
                     )
-                    lost_this_month = 0.0
 
                     for cid, assigned, lost in allocation:
                         session.add(FactSalesInConstrained(
@@ -575,9 +575,9 @@ def compute_sales_in_constrained(
                             unidades_sales_in_constr=float(round(assigned, 4)),
                         ))
                         si_count += 1
-                        lost_this_month += lost
+                        if lost > 0.001:
+                            lost_records.append((cid, date_id_t, lost))
 
-                    lost_by_month[date_id_t] = lost_this_month
                     inv_running = 0.0
                     # §3.5: NO oos_triggered cascade
 
@@ -591,7 +591,8 @@ def compute_sales_in_constrained(
                             unidades_sales_in_constr=0.0,
                         ))
                         si_count += 1
-                    lost_by_month[date_id_t] = demand_total
+                        if d_ct > 0.001:
+                            lost_records.append((cid, date_id_t, d_ct))
                     # §3.5: inv_running unchanged, carries to next month
 
             else:
@@ -605,22 +606,16 @@ def compute_sales_in_constrained(
                     ))
                     si_count += 1
 
-        # Insert lost sales report
-        total_lost_sku = sum(lost_by_month.values())
-        if total_lost_sku > 0:
-            lt_window_end = min(L, len(projection_ids)) - 1
-            detalles = json.dumps({
-                str(did): round(lost, 2) for did, lost in lost_by_month.items()
-            })
+        # Insert per-client-period lost sales records
+        for cid, did, lost_units in lost_records:
             session.add(RptLostSalesOos(
                 sku_id=sku_id,
-                date_id_inicio_lt=projection_ids[0],
-                date_id_fin_lt=projection_ids[lt_window_end],
-                lost_sales_total=float(round(total_lost_sku, 4)),
-                detalles=detalles,
+                cliente_id=cid,
+                date_id=did,
+                lost_sales_units=float(round(lost_units, 4)),
             ))
             lost_count += 1
-            total_lost += total_lost_sku
+            total_lost += lost_units
 
     session.flush()
     logger.info(
@@ -861,6 +856,26 @@ def apply_approved_allocation(
 
         session.flush()
 
+    # §6: Transition workflow state → APROBADO
+    ctrl = (
+        session.query(ConstraintProcessControl)
+        .filter(ConstraintProcessControl.mes_cierre_date_id == mes_cierre_date_id)
+        .first()
+    )
+    if ctrl:
+        ctrl.estado = "APROBADO"
+    else:
+        logger.warning(
+            "apply_approved_allocation: No ConstraintProcessControl found for %d. "
+            "Creating one with estado=APROBADO.",
+            mes_cierre_date_id,
+        )
+        session.add(ConstraintProcessControl(
+            mes_cierre_date_id=mes_cierre_date_id,
+            estado="APROBADO",
+        ))
+    session.flush()
+
     logger.info("apply_approved_allocation: %d records modified", modified)
     return {"estado": "APROBADO", "registros_modificados": modified}
 
@@ -925,6 +940,31 @@ def run_constraint_process(
     summary["pasos"]["4_sales_in_constrained"] = constr_result
 
     session.flush()  # §: no commit
+
+    # §6: Persist workflow state — COMPLETADO_PENDIENTE_APROBACION
+    ctrl = (
+        session.query(ConstraintProcessControl)
+        .filter(ConstraintProcessControl.mes_cierre_date_id == mes_cierre_date_id)
+        .first()
+    )
+    if ctrl:
+        ctrl.estado = "COMPLETADO_PENDIENTE_APROBACION"
+        ctrl.detalles = json.dumps({
+            "po_count": po_count,
+            "lost_sales_skus": constr_result["lost_sales_skus"],
+            "total_lost_sales": constr_result["total_lost_sales"],
+        })
+    else:
+        session.add(ConstraintProcessControl(
+            mes_cierre_date_id=mes_cierre_date_id,
+            estado="COMPLETADO_PENDIENTE_APROBACION",
+            detalles=json.dumps({
+                "po_count": po_count,
+                "lost_sales_skus": constr_result["lost_sales_skus"],
+                "total_lost_sales": constr_result["total_lost_sales"],
+            }),
+        ))
+    session.flush()
 
     summary["estado"] = "COMPLETADO_PENDIENTE_APROBACION"
     summary["mensaje"] = (

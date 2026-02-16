@@ -58,6 +58,7 @@ from .constraint_demand import (
 )
 from .models import (
     Base,
+    ConstraintProcessControl,
     DimCliente,
     DimSku,
     FactInventoryInternalConstrained,
@@ -555,11 +556,12 @@ def get_constraint_summary(sku_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Lost sales
-    lost = (
+    # Lost sales (per-client-period records)
+    lost_rows = (
         db.query(RptLostSalesOos)
         .filter(RptLostSalesOos.sku_id == sku_id)
-        .first()
+        .order_by(RptLostSalesOos.date_id, RptLostSalesOos.cliente_id)
+        .all()
     )
 
     return {
@@ -590,11 +592,16 @@ def get_constraint_summary(sku_id: int, db: Session = Depends(get_db)):
             ],
         },
         "lost_sales": {
-            "total": float(lost.lost_sales_total) if lost else 0,
-            "date_id_inicio_lt": lost.date_id_inicio_lt if lost else None,
-            "date_id_fin_lt": lost.date_id_fin_lt if lost else None,
-            "detalles": lost.detalles if lost else None,
-        } if lost else None,
+            "total": round(sum(float(r.lost_sales_units or 0) for r in lost_rows), 4),
+            "detail": [
+                {
+                    "cliente_id": r.cliente_id,
+                    "date_id": r.date_id,
+                    "lost_sales_units": float(r.lost_sales_units or 0),
+                }
+                for r in lost_rows
+            ],
+        } if lost_rows else None,
     }
 
 
@@ -651,11 +658,32 @@ def approve_allocation(
 
 @app.post("/constraint/phase-b/{mes_cierre_date_id}")
 def run_phase_b(mes_cierre_date_id: int, db: Session = Depends(get_db)):
-    """Phase B: run Sales Out Constraint after gate approval."""
+    """Phase B: run Sales Out Constraint after gate approval.
+    §6: Gate enforcement — requires estado=APROBADO before execution."""
+    # §6: Gate enforcement — verify approval before Phase B
+    ctrl = (
+        db.query(ConstraintProcessControl)
+        .filter(ConstraintProcessControl.mes_cierre_date_id == mes_cierre_date_id)
+        .first()
+    )
+    if not ctrl or ctrl.estado != "APROBADO":
+        current_state = ctrl.estado if ctrl else "NO_RECORD"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Gate bloqueante: Phase B requires estado=APROBADO. "
+                f"Current state: {current_state}. "
+                f"Run /constraint/approve/{mes_cierre_date_id} first."
+            ),
+        )
+
     try:
         from .constraint_phase_b import run_sales_out_constraint
 
         result = run_sales_out_constraint(db, mes_cierre_date_id)
+
+        # Update workflow state → FASE_B_COMPLETADA
+        ctrl.estado = "FASE_B_COMPLETADA"
         db.commit()
         return result
     except Exception as e:

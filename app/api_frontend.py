@@ -377,8 +377,8 @@ def constrained_summary(
     if sku_filter_ids is not None:
         lost_q = lost_q.filter(RptLostSalesOos.sku_id.in_(sku_filter_ids))
     lost_rows = lost_q.all()
-    total_lost = sum(float(r.lost_sales_total or 0) for r in lost_rows)
-    skus_oos = len(lost_rows)
+    total_lost = sum(float(r.lost_sales_units or 0) for r in lost_rows)
+    skus_oos = len(set(r.sku_id for r in lost_rows))
 
     # ── By Familia ──
 
@@ -418,7 +418,7 @@ def constrained_summary(
     lost_fam_q = (
         db.query(
             DimSku.familia.label("familia"),
-            func.sum(RptLostSalesOos.lost_sales_total).label("lost"),
+            func.sum(RptLostSalesOos.lost_sales_units).label("lost"),
         )
         .join(DimSku, RptLostSalesOos.sku_id == DimSku.sku_id)
     )
@@ -466,45 +466,16 @@ def constrained_summary(
         .all()
     )
 
-    # SKUs con OOS por cliente: distribuir lost sales proporcionalmente
-    # segun la demanda unconstrained de cada cliente para ese SKU.
-    # FIX BUG-03: Antes se sumaba el total de lost sales a CADA cliente
-    # (duplicando/triplicando). Ahora se prorratea por demanda.
-    cli_oos = {}
-    cli_lost = {}
-    if lost_rows:
-        for r in lost_rows:
-            sku_lost_total = float(r.lost_sales_total or 0)
-            if sku_lost_total <= 0:
-                continue
-
-            # Obtener demanda unconstrained por cliente para este SKU
-            cli_demand = (
-                db.query(
-                    DimCliente.cliente_nombre.label("cliente"),
-                    func.sum(FactSalesInUnconstrained.unidades_sales_in_unc).label("demand"),
-                )
-                .join(DimCliente, FactSalesInUnconstrained.cliente_id == DimCliente.cliente_id)
-                .filter(
-                    FactSalesInUnconstrained.sku_id == r.sku_id,
-                    FactSalesInUnconstrained.date_id.in_(proj_ids),
-                )
-                .group_by(DimCliente.cliente_nombre)
-                .all()
-            )
-
-            total_demand = sum(float(cd.demand or 0) for cd in cli_demand)
-            if total_demand <= 0:
-                continue
-
-            # Distribuir lost sales proporcionalmente a la demanda de cada cliente
-            for cd in cli_demand:
-                cli_name = cd.cliente
-                cli_demand_val = float(cd.demand or 0)
-                if cli_demand_val > 0:
-                    cli_oos.setdefault(cli_name, set()).add(r.sku_id)
-                    proportion = cli_demand_val / total_demand
-                    cli_lost[cli_name] = cli_lost.get(cli_name, 0) + (sku_lost_total * proportion)
+    # Per-client OOS: now directly from RptLostSalesOos which has cliente_id
+    cli_oos: dict[str, set] = {}
+    cli_lost: dict[str, float] = {}
+    for r in lost_rows:
+        cli_name = db.query(DimCliente.cliente_nombre).filter(
+            DimCliente.cliente_id == r.cliente_id
+        ).scalar()
+        if cli_name:
+            cli_oos.setdefault(cli_name, set()).add(r.sku_id)
+            cli_lost[cli_name] = cli_lost.get(cli_name, 0) + float(r.lost_sales_units or 0)
 
     cliente_data = [
         {

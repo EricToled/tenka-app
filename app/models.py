@@ -383,16 +383,38 @@ class FactSalesInConstrained(Base):
 
 
 class RptLostSalesOos(Base):
+    """
+    Per-client-SKU-period lost sales from Sales In Constraint (§3.5).
+    One row per (cliente_id, sku_id, date_id) where lost_sales > 0.
+    """
     __tablename__ = "rpt_lost_sales_oos"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     sku_id = Column(Integer, ForeignKey("dim_sku.sku_id"), nullable=False)
-    date_id_inicio_lt = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    date_id_fin_lt = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
-    lost_sales_total = Column(Numeric(18, 4), nullable=False)
-    detalles = Column(Text)
+    cliente_id = Column(Integer, ForeignKey("dim_cliente.cliente_id"), nullable=False)
+    date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False)
+    lost_sales_units = Column(Numeric(18, 4), nullable=False)
 
     sku = relationship("DimSku", lazy="joined")
+    cliente = relationship("DimCliente", lazy="joined")
+    tiempo = relationship("DimTiempo", lazy="joined")
+
+
+class ConstraintProcessControl(Base):
+    """
+    Persistent state machine for the Constraint Demand workflow.
+    States: EN_PROCESO → COMPLETADO_PENDIENTE_APROBACION → APROBADO → FASE_B_COMPLETADA
+    One row per mes_cierre_date_id. Upserted on each state transition.
+    """
+    __tablename__ = "constraint_process_control"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    mes_cierre_date_id = Column(Integer, ForeignKey("dim_tiempo.date_id"), nullable=False, unique=True)
+    estado = Column(String(50), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    detalles = Column(Text)
+
+    tiempo = relationship("DimTiempo", lazy="joined")
 
 
 # ─────────────────────────────────────────────
