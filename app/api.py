@@ -50,9 +50,15 @@ from .ingestion_jobs import (
     load_stock_consolidated,
     load_transit_inventory,
 )
-from .constraint_demand import run_constraint_process
+from .constraint_demand import (
+    run_constraint_process,
+    generate_allocation_report,
+    validate_allocation_edits,
+    apply_approved_allocation,
+)
 from .models import (
     Base,
+    ConstraintProcessControl,
     DimCliente,
     DimSku,
     FactInventoryInternalConstrained,
@@ -70,10 +76,22 @@ from .monthly_process import run_monthly_process
 from .report_generator import generate_aggregated_report
 from .time_dimension import ensure_time_dimension
 
+# FIX INF-04: Reemplazado @app.on_event("startup") deprecado con lifespan
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Crea las tablas en la BD si no existen al iniciar."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
 app = FastAPI(
     title="Tenka Inventory & Sales Control",
     description="API para ingesta de datos y control de inventarios con esquema snowflake.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS — permite todas las origenes para staging/demo
@@ -89,11 +107,9 @@ app.add_middleware(
 from .api_frontend import router as frontend_router  # noqa: E402
 app.include_router(frontend_router)
 
-
-@app.on_event("startup")
-def on_startup():
-    """Crea las tablas en la BD si no existen."""
-    Base.metadata.create_all(bind=engine)
+# Registrar endpoints del wizard de cierre de mes
+from .cierre_mes_workflow import router as cierre_router  # noqa: E402
+app.include_router(cierre_router)
 
 
 # ─────────────────────────────────────────────
@@ -482,8 +498,10 @@ def run_constraint(mes_cierre_date_id: int, db: Session = Depends(get_db)):
     """
     try:
         result = run_constraint_process(db, mes_cierre_date_id)
+        db.commit()  # §: business logic no longer commits internally
         return result
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -542,11 +560,12 @@ def get_constraint_summary(sku_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Lost sales
-    lost = (
+    # Lost sales (per-client-period records)
+    lost_rows = (
         db.query(RptLostSalesOos)
         .filter(RptLostSalesOos.sku_id == sku_id)
-        .first()
+        .order_by(RptLostSalesOos.date_id, RptLostSalesOos.cliente_id)
+        .all()
     )
 
     return {
@@ -577,12 +596,156 @@ def get_constraint_summary(sku_id: int, db: Session = Depends(get_db)):
             ],
         },
         "lost_sales": {
-            "total": float(lost.lost_sales_total) if lost else 0,
-            "date_id_inicio_lt": lost.date_id_inicio_lt if lost else None,
-            "date_id_fin_lt": lost.date_id_fin_lt if lost else None,
-            "detalles": lost.detalles if lost else None,
-        } if lost else None,
+            "total": round(sum(float(r.lost_sales_units or 0) for r in lost_rows), 4),
+            "detail": [
+                {
+                    "cliente_id": r.cliente_id,
+                    "date_id": r.date_id,
+                    "lost_sales_units": float(r.lost_sales_units or 0),
+                }
+                for r in lost_rows
+            ],
+        } if lost_rows else None,
     }
+
+
+# ─────────────────────────────────────────────
+# Fase 3: Gate — Allocation report, validate, approve
+# ─────────────────────────────────────────────
+
+
+class AllocationEdit(BaseModel):
+    sku_id: int
+    cliente_id: int
+    date_id: int
+    new_asignacion: float
+
+
+class AllocationApproval(BaseModel):
+    edits: list[AllocationEdit] | None = None
+
+
+@app.get("/constraint/allocation-report/{mes_cierre_date_id}")
+def get_allocation_report(mes_cierre_date_id: int, db: Session = Depends(get_db)):
+    """Gate: returns allocation report for periods 1..L."""
+    return generate_allocation_report(db, mes_cierre_date_id)
+
+
+@app.post("/constraint/approve/{mes_cierre_date_id}")
+def approve_allocation(
+    mes_cierre_date_id: int,
+    approval: AllocationApproval,
+    db: Session = Depends(get_db),
+):
+    """Gate: validate edits and apply approval. Triggers Phase B after."""
+    if approval.edits:
+        validation = validate_allocation_edits(
+            db, mes_cierre_date_id,
+            [e.model_dump() for e in approval.edits],
+        )
+        if not validation["valid"]:
+            raise HTTPException(400, detail=validation["errors"])
+        result = apply_approved_allocation(
+            db, mes_cierre_date_id,
+            [e.model_dump() for e in approval.edits],
+        )
+    else:
+        result = apply_approved_allocation(db, mes_cierre_date_id)
+    db.commit()
+    return result
+
+
+# ─────────────────────────────────────────────
+# Phase B: Sales Out Constraint
+# ─────────────────────────────────────────────
+
+
+@app.post("/constraint/phase-b/{mes_cierre_date_id}")
+def run_phase_b(mes_cierre_date_id: int, db: Session = Depends(get_db)):
+    """Phase B: run Sales Out Constraint after gate approval.
+    §6: Gate enforcement — requires estado=APROBADO before execution."""
+    # §6: Gate enforcement — verify approval before Phase B
+    ctrl = (
+        db.query(ConstraintProcessControl)
+        .filter(ConstraintProcessControl.mes_cierre_date_id == mes_cierre_date_id)
+        .first()
+    )
+    if not ctrl or ctrl.estado != "APROBADO":
+        current_state = ctrl.estado if ctrl else "NO_RECORD"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Gate bloqueante: Phase B requires estado=APROBADO. "
+                f"Current state: {current_state}. "
+                f"Run /constraint/approve/{mes_cierre_date_id} first."
+            ),
+        )
+
+    try:
+        from .constraint_phase_b import run_sales_out_constraint
+
+        result = run_sales_out_constraint(db, mes_cierre_date_id)
+
+        # Update workflow state → FASE_B_COMPLETADA
+        ctrl.estado = "FASE_B_COMPLETADA"
+        db.commit()
+        return result
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, detail=str(e))
+
+
+# ─────────────────────────────────────────────
+# Phase C: Lost Sales, DOS, Constrained Report
+# ─────────────────────────────────────────────
+
+
+@app.get("/constraint/lost-sales/{mes_cierre_date_id}")
+def get_lost_sales(mes_cierre_date_id: int, db: Session = Depends(get_db)):
+    """Phase C: lost sales report for SI and SO."""
+    from .constraint_phase_b import generate_lost_sales_report
+
+    return generate_lost_sales_report(db, mes_cierre_date_id)
+
+
+@app.post("/constraint/dos/{mes_cierre_date_id}")
+def compute_dos(mes_cierre_date_id: int, db: Session = Depends(get_db)):
+    """Phase C: compute DOS Constraint for client and internal."""
+    try:
+        from .constraint_phase_b import compute_dos_constraint
+
+        result = compute_dos_constraint(db, mes_cierre_date_id)
+        db.commit()
+        return result
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, detail=str(e))
+
+
+@app.get("/constraint/report/{mes_cierre_date_id}")
+def get_constrained_report(mes_cierre_date_id: int, db: Session = Depends(get_db)):
+    """Phase C: constrained aggregated report (4 levels)."""
+    try:
+        from .report_generator import generate_constrained_report
+
+        df = generate_constrained_report(db, mes_cierre_date_id)
+        if df.empty:
+            return {"message": "No data for constrained report.", "data": []}
+
+        output_cols = [
+            "level", "nivel_nombre", "cliente", "familia", "sku_descripcion",
+            "upc", "date_id", "tipo", "sales_out", "sales_in",
+            "inventario_final", "days_of_sale",
+        ]
+        df_out = df[[c for c in output_cols if c in df.columns]]
+        records = df_out.where(df_out.notna(), None).to_dict(orient="records")
+        return {
+            "mes_cierre_date_id": mes_cierre_date_id,
+            "total_rows": len(records),
+            "data": records,
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
 
 
 # ─────────────────────────────────────────────

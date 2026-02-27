@@ -34,6 +34,7 @@ from .models import (
     FactStockCliente,
     RptForecastSinCatalogo,
 )
+from .eligibility import _generate_date_id_range
 from .monthly_close import _compute_month_minus_n, run_monthly_close
 from .new_client_detection import (
     detect_and_report_new_client_skus,
@@ -128,23 +129,39 @@ def _compute_closing_month_inventory(
         if inv_final_cierre < 0:
             inv_final_cierre = 0
 
-        # Calcular promedio ventas Sales Out de los 12 meses anteriores al cierre
+        # Calcular promedio ventas Sales Out de los N meses anteriores al cierre
+        # FIX R5: N = min(12, meses desde first_sale_date), NOT hardcoded 12
         prev_12_start = _compute_month_minus_n(mes_cierre_date_id, 12)
         prev_12_end = _compute_month_minus_n(mes_cierre_date_id, 1)
+        prev_ids = _generate_date_id_range(prev_12_start, prev_12_end)
 
-        avg_ventas = (
+        # Get first_sale_date for this client-SKU pair
+        first_sale = (
+            session.query(func.min(FactSalesOut.date_id))
+            .filter(
+                FactSalesOut.cliente_id == cliente_id,
+                FactSalesOut.sku_id == sku_id,
+            )
+            .scalar()
+        )
+        if first_sale and first_sale > prev_12_start:
+            prev_ids = [d for d in prev_ids if d >= first_sale]
+
+        n_months = len(prev_ids)
+
+        sum_ventas = (
             session.query(
-                func.avg(FactSalesOut.unidades_sales_out)
+                func.sum(FactSalesOut.unidades_sales_out)
             )
             .filter(
                 FactSalesOut.cliente_id == cliente_id,
                 FactSalesOut.sku_id == sku_id,
-                FactSalesOut.date_id >= prev_12_start,
-                FactSalesOut.date_id <= prev_12_end,
+                FactSalesOut.date_id.in_(prev_ids),
             )
             .scalar()
-        )
-        avg_ventas = float(avg_ventas or 0)
+        ) if n_months > 0 else None
+
+        avg_ventas = float(sum_ventas or 0) / n_months if n_months > 0 else 0.0
 
         if avg_ventas > 0:
             mos = inv_final_cierre / avg_ventas

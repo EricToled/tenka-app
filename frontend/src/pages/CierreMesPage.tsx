@@ -1,201 +1,464 @@
-import { useState } from 'react'
-import { CheckCircle, Circle, Loader2, Play } from 'lucide-react'
-import FileUploadCard from '../components/FileUploadCard'
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import {
+  CheckCircle, Circle, Loader2, Play, ArrowRight, ArrowLeft,
+  AlertTriangle, Package, ClipboardPaste,
+} from 'lucide-react'
 import api from '../api/client'
 
-const uploads = [
-  { label: 'Catalogo de SKU', endpoint: '/upload/sku', description: 'SKU Control Table.xlsx' },
-  { label: 'Sales In', endpoint: '/upload/sales-in', description: 'Sales In Table.xlsx' },
-  { label: 'Sales Out', endpoint: '/upload/sales-out', description: 'Sales Out Table.xlsx' },
-  { label: 'Stock Consolidado', endpoint: '/upload/stock-consolidated', description: 'Sales Stock Consolidated.xlsx' },
-  { label: 'Inventario Interno', endpoint: '/upload/internal-inventory', description: 'Tabla inventario Interno.xlsx' },
-  { label: 'Inventario en Transito', endpoint: '/upload/transit-inventory', description: 'Tabla inventario en transito.xlsx' },
-  { label: 'Forecast', endpoint: '/upload/forecast', description: 'Annual sales Forecast.xlsx' },
-]
+interface ClosingMonth {
+  date_id: number
+  label: string
+  last_data_month: number
+}
+
+interface StepResult {
+  data?: any
+  error?: string
+}
 
 export default function CierreMesPage() {
-  const [step, setStep] = useState(1)
-  const [mesCierre, setMesCierre] = useState('202507')
-  const [closeResult, setCloseResult] = useState<any>(null)
-  const [closeLoading, setCloseLoading] = useState(false)
-  const [uncResult, setUncResult] = useState<any>(null)
-  const [uncLoading, setUncLoading] = useState(false)
-  const [constrResult, setConstrResult] = useState<any>(null)
-  const [constrLoading, setConstrLoading] = useState(false)
+  const navigate = useNavigate()
+  const [step, setStep] = useState(0)
 
-  const handleClose = async () => {
-    setCloseLoading(true)
-    setCloseResult(null)
+  // Closing month
+  const [closingMonth, setClosingMonth] = useState<ClosingMonth | null>(null)
+  const [closingLoading, setClosingLoading] = useState(false)
+  const [closingError, setClosingError] = useState<string | null>(null)
+
+  // Step 1: Sales Out
+  const [soPaste, setSoPaste] = useState('')
+  const [soResult, setSoResult] = useState<StepResult | null>(null)
+  const [soLoading, setSoLoading] = useState(false)
+
+  // Step 2: Sales In
+  const [siPaste, setSiPaste] = useState('')
+  const [siResult, setSiResult] = useState<StepResult | null>(null)
+  const [siLoading, setSiLoading] = useState(false)
+
+  // Step 3: Calculate inventory
+  const [invResult, setInvResult] = useState<StepResult | null>(null)
+  const [invLoading, setInvLoading] = useState(false)
+
+  // Step 4: Internal inventory
+  const [intPaste, setIntPaste] = useState('')
+  const [intResult, setIntResult] = useState<StepResult | null>(null)
+  const [intLoading, setIntLoading] = useState(false)
+
+  // Step 5: Projections
+  const [projResult, setProjResult] = useState<StepResult | null>(null)
+  const [projLoading, setProjLoading] = useState(false)
+
+  // Auto-detect closing month on mount
+  useEffect(() => {
+    detectClosingMonth()
+  }, [])
+
+  const detectClosingMonth = async () => {
+    setClosingLoading(true)
+    setClosingError(null)
     try {
-      const res = await api.post(`/monthly-close/${mesCierre}`)
-      setCloseResult(res.data)
+      const res = await api.get('/api/cierre/closing-month')
+      setClosingMonth(res.data)
     } catch (err: any) {
-      setCloseResult({ error: err?.response?.data?.detail || err.message })
+      setClosingError(err?.response?.data?.detail || 'Error detectando mes de cierre')
     } finally {
-      setCloseLoading(false)
+      setClosingLoading(false)
     }
   }
 
-  const handleUnconstrained = async () => {
-    setUncLoading(true)
-    setUncResult(null)
+  const handleUploadSO = async () => {
+    if (!closingMonth || !soPaste.trim()) return
+    setSoLoading(true)
+    setSoResult(null)
     try {
-      const res = await api.post(`/unconstrained/run/${mesCierre}`)
-      setUncResult(res.data)
+      const res = await api.post('/api/cierre/upload-sales', {
+        tsv_data: soPaste,
+        tipo: 'sales_out',
+        mes_cierre_date_id: closingMonth.date_id,
+      })
+      setSoResult({ data: res.data })
     } catch (err: any) {
-      setUncResult({ error: err?.response?.data?.detail || err.message })
+      setSoResult({ error: err?.response?.data?.detail || err.message })
     } finally {
-      setUncLoading(false)
+      setSoLoading(false)
     }
   }
 
-  const handleConstrained = async () => {
-    setConstrLoading(true)
-    setConstrResult(null)
+  const handleUploadSI = async () => {
+    if (!closingMonth || !siPaste.trim()) return
+    setSiLoading(true)
+    setSiResult(null)
     try {
-      const res = await api.post(`/constraint/run/${mesCierre}`)
-      setConstrResult(res.data)
+      const res = await api.post('/api/cierre/upload-sales', {
+        tsv_data: siPaste,
+        tipo: 'sales_in',
+        mes_cierre_date_id: closingMonth.date_id,
+      })
+      setSiResult({ data: res.data })
     } catch (err: any) {
-      setConstrResult({ error: err?.response?.data?.detail || err.message })
+      setSiResult({ error: err?.response?.data?.detail || err.message })
     } finally {
-      setConstrLoading(false)
+      setSiLoading(false)
     }
   }
 
-  const StepIndicator = ({ num, label, active }: { num: number; label: string; active: boolean }) => (
-    <button
-      onClick={() => setStep(num)}
-      className={`flex items-center gap-2 px-4 py-2 rounded-xl transition-all text-sm font-medium ${
-        active
-          ? 'bg-tenka-accent/15 text-tenka-accent border border-tenka-accent/30'
-          : step > num
-          ? 'text-tenka-success'
-          : 'text-tenka-muted hover:text-tenka-text'
-      }`}
-    >
-      {step > num ? <CheckCircle size={16} /> : <Circle size={16} />}
-      Paso {num}: {label}
-    </button>
+  const handleCalcInventory = async () => {
+    if (!closingMonth) return
+    setInvLoading(true)
+    setInvResult(null)
+    try {
+      const res = await api.post('/api/cierre/calculate-inventory', {
+        mes_cierre_date_id: closingMonth.date_id,
+      })
+      setInvResult({ data: res.data })
+    } catch (err: any) {
+      setInvResult({ error: err?.response?.data?.detail || err.message })
+    } finally {
+      setInvLoading(false)
+    }
+  }
+
+  const handleUploadInternal = async () => {
+    if (!closingMonth || !intPaste.trim()) return
+    setIntLoading(true)
+    setIntResult(null)
+    try {
+      const res = await api.post('/api/cierre/upload-internal-inv', {
+        tsv_data: intPaste,
+        mes_cierre_date_id: closingMonth.date_id,
+      })
+      setIntResult({ data: res.data })
+    } catch (err: any) {
+      setIntResult({ error: err?.response?.data?.detail || err.message })
+    } finally {
+      setIntLoading(false)
+    }
+  }
+
+  const handleRunProjections = async () => {
+    if (!closingMonth) return
+    setProjLoading(true)
+    setProjResult(null)
+    try {
+      const res = await api.post('/api/cierre/run-projections', {
+        mes_cierre_date_id: closingMonth.date_id,
+      })
+      setProjResult({ data: res.data })
+    } catch (err: any) {
+      setProjResult({ error: err?.response?.data?.detail || err.message })
+    } finally {
+      setProjLoading(false)
+    }
+  }
+
+  // ── UI Components ──
+
+  const steps = [
+    'Detectar mes',
+    'Sales Out',
+    'Sales In',
+    'Inventario cliente',
+    'Inventario interno',
+    'Proyecciones',
+  ]
+
+  const StepIndicator = () => (
+    <div className="flex items-center gap-1 mb-8 overflow-x-auto pb-2">
+      {steps.map((label, i) => {
+        const isActive = step === i + 1 || (i === 0 && step === 0)
+        const isDone = step > i + 1 || step === 6
+        return (
+          <div key={i} className="flex items-center gap-1">
+            <button
+              onClick={() => { if (isDone || isActive) setStep(i === 0 ? 0 : i + 1) }}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all whitespace-nowrap ${
+                isActive
+                  ? 'bg-tenka-accent/15 text-tenka-accent border border-tenka-accent/30'
+                  : isDone
+                    ? 'bg-tenka-card text-green-500 border border-green-500/20'
+                    : 'text-tenka-muted border border-transparent'
+              }`}
+            >
+              {isDone ? <CheckCircle size={14} /> : <Circle size={14} />}
+              {label}
+            </button>
+            {i < steps.length - 1 && <ArrowRight size={12} className="text-tenka-muted/40 flex-shrink-0" />}
+          </div>
+        )
+      })}
+    </div>
   )
 
+  const ResultDisplay = ({ result, label }: { result: StepResult | null; label: string }) => {
+    if (!result) return null
+    if (result.error) return (
+      <div className="mt-4 bg-red-500/10 border border-red-500/20 rounded-xl p-4">
+        <div className="flex items-center gap-2 text-red-400 text-sm font-medium mb-1">
+          <AlertTriangle size={14} /> Error
+        </div>
+        <p className="text-red-300 text-xs">{result.error}</p>
+      </div>
+    )
+    return (
+      <div className="mt-4 bg-green-500/10 border border-green-500/20 rounded-xl p-4">
+        <div className="flex items-center gap-2 text-green-400 text-sm font-medium mb-2">
+          <CheckCircle size={14} /> {label}
+        </div>
+        <pre className="text-xs text-tenka-muted overflow-auto max-h-48">
+          {JSON.stringify(result.data, null, 2)}
+        </pre>
+      </div>
+    )
+  }
+
+  const NavButtons = ({ onBack, onNext, nextLabel, nextDisabled }: {
+    onBack?: () => void
+    onNext?: () => void
+    nextLabel?: string
+    nextDisabled?: boolean
+  }) => (
+    <div className="flex justify-between items-center mt-6">
+      {onBack ? (
+        <button onClick={onBack} className="flex items-center gap-1 text-tenka-muted hover:text-tenka-text text-sm">
+          <ArrowLeft size={14} /> Anterior
+        </button>
+      ) : <div />}
+      {onNext && (
+        <button
+          onClick={onNext}
+          disabled={nextDisabled}
+          className="flex items-center gap-1 bg-tenka-accent hover:bg-tenka-accent/80 disabled:opacity-50 text-white px-5 py-2.5 rounded-xl text-sm font-medium transition-all"
+        >
+          {nextLabel || 'Siguiente'} <ArrowRight size={14} />
+        </button>
+      )}
+    </div>
+  )
+
+  const PasteArea = ({ value, onChange, placeholder }: {
+    value: string
+    onChange: (v: string) => void
+    placeholder: string
+  }) => (
+    <textarea
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      rows={10}
+      className="w-full bg-tenka-surface border border-tenka-border rounded-xl p-4 text-sm font-mono text-tenka-text placeholder-tenka-muted/50 focus:outline-none focus:border-tenka-accent/50 resize-y"
+    />
+  )
+
+  // ── Render ──
+
   return (
-    <div className="max-w-6xl">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-tenka-text">Cierre de Mes</h1>
-        <p className="text-tenka-muted mt-2">
-          Carga la informacion del periodo, ejecuta el cierre mensual y recalcula las proyecciones
-        </p>
-      </div>
+    <div className="max-w-3xl">
+      <h1 className="text-3xl font-bold text-tenka-text mb-2">Cierre de Mes</h1>
+      <p className="text-tenka-muted text-sm mb-6">
+        Wizard guiado para cerrar el mes, cargar datos y ejecutar proyecciones.
+      </p>
 
-      {/* Step indicators */}
-      <div className="flex items-center gap-4 mb-8">
-        <StepIndicator num={1} label="Cargar informacion" active={step === 1} />
-        <div className="h-px w-8 bg-tenka-border" />
-        <StepIndicator num={2} label="Ejecutar cierre" active={step === 2} />
-        <div className="h-px w-8 bg-tenka-border" />
-        <StepIndicator num={3} label="Recalcular proyecciones" active={step === 3} />
-      </div>
+      {step > 0 && step < 6 && <StepIndicator />}
 
-      {/* Step 1: Upload */}
+      {/* ═══ Step 0: Landing ═══ */}
+      {step === 0 && (
+        <div className="max-w-md">
+          <div className="bg-tenka-card rounded-2xl border border-tenka-border p-6">
+            {closingLoading && (
+              <div className="flex items-center gap-2 text-tenka-muted">
+                <Loader2 className="animate-spin" size={16} /> Detectando mes de cierre...
+              </div>
+            )}
+            {closingError && (
+              <div className="text-red-400 text-sm">
+                <AlertTriangle size={14} className="inline mr-1" />
+                {closingError}
+              </div>
+            )}
+            {closingMonth && (
+              <>
+                <p className="text-sm text-tenka-muted mb-1">Último mes con datos:</p>
+                <p className="text-lg font-semibold text-tenka-text mb-4">{closingMonth.last_data_month}</p>
+                <p className="text-sm text-tenka-muted mb-1">Mes a cerrar:</p>
+                <p className="text-3xl font-bold text-tenka-accent">{closingMonth.label}</p>
+              </>
+            )}
+          </div>
+          {closingMonth && (
+            <button
+              onClick={() => setStep(1)}
+              className="mt-6 w-full bg-tenka-accent hover:bg-tenka-accent/80 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+            >
+              <Play size={16} /> Iniciar Cierre
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ═══ Step 1: Upload Sales Out ═══ */}
       {step === 1 && (
         <div>
-          <h2 className="text-lg font-semibold mb-4">Cargar archivos del mes</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            {uploads.map((u) => (
-              <FileUploadCard key={u.endpoint} {...u} />
-            ))}
-          </div>
-          <div className="mt-6 text-right">
-            <button onClick={() => setStep(2)} className="bg-tenka-accent hover:bg-tenka-accent/80 text-white px-6 py-2.5 rounded-xl text-sm font-medium transition-all">
-              Siguiente: Ejecutar cierre
-            </button>
-          </div>
+          <h2 className="text-lg font-semibold text-tenka-text mb-1">Paso 1: Cargar Sales Out</h2>
+          <p className="text-sm text-tenka-muted mb-4">
+            Pegue los datos de sell-out (ventas al consumidor) desde su hoja de cálculo.
+          </p>
+          <PasteArea
+            value={soPaste}
+            onChange={setSoPaste}
+            placeholder={"Fecha Final\tCliente\tUPC\tUnidades\n2025-08-31\tCLIENTE A\t7501234567890\t150\n2025-08-31\tCLIENTE B\t7501234567891\t230"}
+          />
+          <button
+            onClick={handleUploadSO}
+            disabled={soLoading || !soPaste.trim()}
+            className="mt-3 w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+          >
+            {soLoading ? <Loader2 className="animate-spin" size={16} /> : <ClipboardPaste size={16} />}
+            Cargar Sales Out
+          </button>
+          <ResultDisplay result={soResult} label="Sales Out cargado correctamente" />
+          <NavButtons
+            onBack={() => setStep(0)}
+            onNext={() => setStep(2)}
+            nextDisabled={!soResult?.data}
+          />
         </div>
       )}
 
-      {/* Step 2: Monthly Close */}
+      {/* ═══ Step 2: Upload Sales In ═══ */}
       {step === 2 && (
-        <div className="max-w-xl">
-          <h2 className="text-lg font-semibold mb-4">Ejecutar cierre mensual</h2>
-          <div className="bg-tenka-card rounded-2xl border border-tenka-border p-6">
-            <label className="block text-sm text-tenka-muted mb-2">Mes de cierre (YYYYMM)</label>
-            <input
-              type="text"
-              value={mesCierre}
-              onChange={(e) => setMesCierre(e.target.value)}
-              className="bg-tenka-surface border border-tenka-border rounded-xl px-4 py-2.5 text-sm text-tenka-text w-full focus:outline-none focus:border-tenka-accent"
-            />
-            <button
-              onClick={handleClose}
-              disabled={closeLoading}
-              className="mt-4 w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
-            >
-              {closeLoading ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />}
-              Cerrar mes {mesCierre}
-            </button>
-            {closeResult && (
-              <pre className="mt-4 bg-tenka-surface rounded-xl p-4 text-xs text-tenka-muted overflow-auto max-h-48">
-                {JSON.stringify(closeResult, null, 2)}
-              </pre>
-            )}
-          </div>
-          <div className="mt-6 flex justify-between">
-            <button onClick={() => setStep(1)} className="text-tenka-muted hover:text-tenka-text text-sm">
-              Volver
-            </button>
-            <button onClick={() => setStep(3)} className="bg-tenka-accent hover:bg-tenka-accent/80 text-white px-6 py-2.5 rounded-xl text-sm font-medium transition-all">
-              Siguiente: Recalcular
-            </button>
-          </div>
+        <div>
+          <h2 className="text-lg font-semibold text-tenka-text mb-1">Paso 2: Cargar Sales In</h2>
+          <p className="text-sm text-tenka-muted mb-4">
+            Pegue los datos de sell-in (ventas de Tenka al cliente) desde su hoja de cálculo.
+          </p>
+          <PasteArea
+            value={siPaste}
+            onChange={setSiPaste}
+            placeholder={"Fecha Final\tCliente\tUPC\tUnidades\n2025-08-31\tCLIENTE A\t7501234567890\t200\n2025-08-31\tCLIENTE B\t7501234567891\t180"}
+          />
+          <button
+            onClick={handleUploadSI}
+            disabled={siLoading || !siPaste.trim()}
+            className="mt-3 w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+          >
+            {siLoading ? <Loader2 className="animate-spin" size={16} /> : <ClipboardPaste size={16} />}
+            Cargar Sales In
+          </button>
+          <ResultDisplay result={siResult} label="Sales In cargado correctamente" />
+          <NavButtons
+            onBack={() => setStep(1)}
+            onNext={() => setStep(3)}
+            nextDisabled={!siResult?.data}
+          />
         </div>
       )}
 
-      {/* Step 3: Recalculate */}
+      {/* ═══ Step 3: Calculate client inventory ═══ */}
       {step === 3 && (
-        <div className="max-w-2xl space-y-4">
-          <h2 className="text-lg font-semibold mb-4">Recalcular proyecciones</h2>
-
-          {/* Unconstrained */}
+        <div>
+          <h2 className="text-lg font-semibold text-tenka-text mb-1">Paso 3: Calcular inventario de cliente</h2>
+          <p className="text-sm text-tenka-muted mb-4">
+            Calcula el inventario final de cada cliente-SKU para {closingMonth?.label}. Si resulta negativo, aplica corrección retrospectiva automática.
+          </p>
           <div className="bg-tenka-card rounded-2xl border border-tenka-border p-6">
-            <h3 className="font-medium mb-2">Demanda Unconstrained</h3>
-            <p className="text-sm text-tenka-muted mb-4">Recalcula Sales Out, Sales In e inventario proyectado para 12 meses</p>
             <button
-              onClick={handleUnconstrained}
-              disabled={uncLoading}
-              className="bg-tenka-accent hover:bg-tenka-accent/80 disabled:opacity-50 text-white px-6 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2"
+              onClick={handleCalcInventory}
+              disabled={invLoading}
+              className="w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
             >
-              {uncLoading ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />}
-              Recalcular Unconstrained
+              {invLoading ? <Loader2 className="animate-spin" size={16} /> : <Package size={16} />}
+              Calcular inventario
             </button>
-            {uncResult && (
-              <pre className="mt-4 bg-tenka-surface rounded-xl p-4 text-xs text-tenka-muted overflow-auto max-h-48">
-                {JSON.stringify(uncResult, null, 2)}
-              </pre>
+            <ResultDisplay result={invResult} label="Inventario calculado" />
+          </div>
+          <NavButtons
+            onBack={() => setStep(2)}
+            onNext={() => setStep(4)}
+            nextDisabled={!invResult?.data}
+          />
+        </div>
+      )}
+
+      {/* ═══ Step 4: Upload internal inventory ═══ */}
+      {step === 4 && (
+        <div>
+          <h2 className="text-lg font-semibold text-tenka-text mb-1">Paso 4: Cargar inventario interno</h2>
+          <p className="text-sm text-tenka-muted mb-4">
+            Pegue el inventario interno de Tenka al cierre del mes.
+          </p>
+          <PasteArea
+            value={intPaste}
+            onChange={setIntPaste}
+            placeholder={"UPC\tInventario Cierre de Mes\n7501234567890\t500\n7501234567891\t1200\n7501234567892\t340"}
+          />
+          <button
+            onClick={handleUploadInternal}
+            disabled={intLoading || !intPaste.trim()}
+            className="mt-3 w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+          >
+            {intLoading ? <Loader2 className="animate-spin" size={16} /> : <ClipboardPaste size={16} />}
+            Cargar inventario interno
+          </button>
+          <ResultDisplay result={intResult} label="Inventario interno cargado" />
+          <NavButtons
+            onBack={() => setStep(3)}
+            onNext={() => setStep(5)}
+            nextDisabled={!intResult?.data}
+          />
+        </div>
+      )}
+
+      {/* ═══ Step 5: Run projections ═══ */}
+      {step === 5 && (
+        <div>
+          <h2 className="text-lg font-semibold text-tenka-text mb-1">Paso 5: Ejecutar proyecciones</h2>
+          <p className="text-sm text-tenka-muted mb-4">
+            Ejecuta el proceso mensual completo (Unconstrained + Constrained Demand) para {closingMonth?.label}.
+          </p>
+          <div className="bg-tenka-card rounded-2xl border border-tenka-border p-6">
+            <button
+              onClick={handleRunProjections}
+              disabled={projLoading}
+              className="w-full bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+            >
+              {projLoading ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />}
+              Ejecutar proyecciones
+            </button>
+            <ResultDisplay result={projResult} label="Proyecciones completadas" />
+            {projResult?.data && (
+              <button
+                onClick={() => setStep(6)}
+                className="mt-4 w-full bg-green-600 hover:bg-green-600/80 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2"
+              >
+                <CheckCircle size={16} /> Finalizar cierre
+              </button>
             )}
           </div>
+          <NavButtons onBack={() => setStep(4)} />
+        </div>
+      )}
 
-          {/* Constrained */}
-          <div className="bg-tenka-card rounded-2xl border border-tenka-border p-6">
-            <h3 className="font-medium mb-2">Restricciones de Inventario (Constraint)</h3>
-            <p className="text-sm text-tenka-muted mb-4">Genera POs, aplica restricciones de stock y calcula ventas perdidas por OOS</p>
+      {/* ═══ Step 6: Done ═══ */}
+      {step === 6 && (
+        <div className="max-w-md text-center mx-auto">
+          <div className="bg-green-500/10 border border-green-500/20 rounded-2xl p-8">
+            <CheckCircle size={48} className="text-green-400 mx-auto mb-4" />
+            <h2 className="text-2xl font-bold text-tenka-text mb-2">Cierre completado</h2>
+            <p className="text-tenka-muted text-sm mb-6">
+              El mes <span className="font-semibold text-tenka-accent">{closingMonth?.label}</span> se cerró exitosamente. Las proyecciones Unconstrained y Constrained están disponibles en Reportes.
+            </p>
+            <div className="bg-tenka-surface rounded-xl p-4 text-left text-xs text-tenka-muted space-y-1 mb-6">
+              <p><span className="text-tenka-text font-medium">Sales Out:</span> {soResult?.data?.inserted ?? 0} registros</p>
+              <p><span className="text-tenka-text font-medium">Sales In:</span> {siResult?.data?.inserted ?? 0} registros</p>
+              <p><span className="text-tenka-text font-medium">Inventario cliente:</span> {invResult?.data?.calculated ?? 0} pares calculados, {invResult?.data?.corrections ?? 0} correcciones</p>
+              <p><span className="text-tenka-text font-medium">Inventario interno:</span> {intResult?.data?.inserted ?? 0} SKUs</p>
+            </div>
             <button
-              onClick={handleConstrained}
-              disabled={constrLoading}
-              className="bg-tenka-accent2 hover:bg-tenka-accent2/80 disabled:opacity-50 text-white px-6 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2"
+              onClick={() => navigate('/reportes')}
+              className="w-full bg-tenka-accent hover:bg-tenka-accent/80 text-white px-6 py-3 rounded-xl text-sm font-semibold transition-all"
             >
-              {constrLoading ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />}
-              Aplicar restricciones (Constrained)
-            </button>
-            {constrResult && (
-              <pre className="mt-4 bg-tenka-surface rounded-xl p-4 text-xs text-tenka-muted overflow-auto max-h-48">
-                {JSON.stringify(constrResult, null, 2)}
-              </pre>
-            )}
-          </div>
-
-          <div className="mt-6">
-            <button onClick={() => setStep(1)} className="text-tenka-muted hover:text-tenka-text text-sm">
-              Volver al inicio
+              Ir a Reportes
             </button>
           </div>
         </div>

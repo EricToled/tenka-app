@@ -429,6 +429,20 @@ def project_sales_in_and_inventory_unc(
         val = float(r.days_of_sale_historico) if r.days_of_sale_historico is not None else None
         dos_last_lookup[(r.cliente_id, r.sku_id)] = val
 
+    # Pre-cargar fecha de primera venta por par cliente-SKU
+    first_sale_lookup: dict[tuple[int, int], int] = {}
+    first_sale_rows = (
+        session.query(
+            FactSalesOut.cliente_id,
+            FactSalesOut.sku_id,
+            func.min(FactSalesOut.date_id).label("first_date"),
+        )
+        .group_by(FactSalesOut.cliente_id, FactSalesOut.sku_id)
+        .all()
+    )
+    for r in first_sale_rows:
+        first_sale_lookup[(r.cliente_id, r.sku_id)] = r.first_date
+
     # Pre-cargar inventario final del ultimo mes historico
     inv_last = (
         session.query(
@@ -470,6 +484,9 @@ def project_sales_in_and_inventory_unc(
         # Inventario final del ultimo mes historico
         inv_inicial_0 = inv_last_lookup.get((cid, sid), 0.0)
 
+        # Fecha de primera venta para este par (para calcular N correcto)
+        first_date = first_sale_lookup.get((cid, sid))
+
         # Seccion 9: Algoritmo iterativo
         sales_in, inv_final, mos, dos = _iterative_projection(
             hist_series=hist_series,
@@ -478,6 +495,7 @@ def project_sales_in_and_inventory_unc(
             sales_out_proj=sales_out_proj,
             dos_objectives=dos_objectives,
             inv_inicial_0=inv_inicial_0,
+            first_sale_date_id=first_date,
         )
 
         # Crear registros (convertir a float nativo para psycopg2)
@@ -524,12 +542,18 @@ def _iterative_projection(
     dos_objectives: list[float],
     inv_inicial_0: float,
     max_iterations: int = 20,
+    first_sale_date_id: int | None = None,
 ) -> tuple[list[float], list[float], list[float | None], list[float | None]]:
     """
     Algoritmo iterativo de proyeccion (Secciones 8-9).
 
     Repite el calculo de t=1..12 hasta que todas las Sales In >= 0
     o se alcance max_iterations.
+
+    El promedio de ventas para DOS se calcula sobre N meses, donde:
+    N = min(12, meses_desde_primera_venta_hasta_mes_anterior).
+    Si un par cliente-SKU empezo operaciones recientemente (ej. Feb 2025),
+    solo se promedian los meses activos, no 12.
 
     Args:
         hist_series: Ventas historicas Sales Out (12 valores).
@@ -539,6 +563,7 @@ def _iterative_projection(
         dos_objectives: Objetivos de DOS por mes (12 valores).
         inv_inicial_0: Inventario final del ultimo mes historico.
         max_iterations: Maximo de iteraciones del reajuste.
+        first_sale_date_id: Primer date_id con ventas del par cliente-SKU.
 
     Returns:
         Tupla de 4 listas de 12 valores:
@@ -555,6 +580,7 @@ def _iterative_projection(
     # Serie combinada para promedios rolling:
     # [12 meses historicos] + [12 meses proyectados Sales Out]
     combined_sales = list(hist_series) + list(sales_out_proj)
+    combined_dates = list(historico_ids) + list(projection_ids)
 
     for iteration in range(max_iterations):
         any_negative = False
@@ -569,24 +595,33 @@ def _iterative_projection(
             # Sales Out del mes t
             so_t = sales_out_proj[t]
 
-            # Promedio de ventas de los 12 meses anteriores al mes t
-            # Los 12 meses anteriores al mes t de proyeccion:
-            #   - Si t=0, los 12 meses historicos (indices 0..11 de combined)
-            #   - Si t=1, historicos[1..11] + proyectados[0]
-            #   - etc.
+            # Ventana de los 12 meses anteriores al mes t de proyeccion
             start_idx = t  # en combined_sales, los 12 meses anteriores empiezan en indice t
             end_idx = t + 12
-            prev_12 = combined_sales[start_idx:end_idx]
-            avg_12 = sum(prev_12) / 12 if len(prev_12) == 12 else (
-                sum(prev_12) / len(prev_12) if prev_12 else 0.0
-            )
+            prev_12_dates = combined_dates[start_idx:end_idx]
+            prev_12_values = combined_sales[start_idx:end_idx]
+
+            # Ajustar ventana por fecha de inicio de operaciones:
+            # solo considerar meses >= first_sale_date_id
+            if first_sale_date_id is not None:
+                filtered = [
+                    (d, v) for d, v in zip(prev_12_dates, prev_12_values)
+                    if d >= first_sale_date_id
+                ]
+                if filtered:
+                    prev_12_values = [v for _, v in filtered]
+                else:
+                    prev_12_values = []
+
+            n_meses = len(prev_12_values)
+            avg_n = sum(prev_12_values) / n_meses if n_meses > 0 else 0.0
 
             # DOS objetivo del mes t
             dos_obj = dos_objectives[t]
 
             # Inventario final deseado para cumplir el DOS objetivo
-            if avg_12 > 0:
-                inv_final_deseado = (dos_obj / 30.0) * avg_12
+            if avg_n > 0:
+                inv_final_deseado = (dos_obj / 30.0) * avg_n
             else:
                 inv_final_deseado = 0.0
 
@@ -604,8 +639,8 @@ def _iterative_projection(
                 inv_f = 0.0
 
             # Calcular DOS y MOS reales
-            if avg_12 > 0:
-                mos_t = inv_f / avg_12
+            if avg_n > 0:
+                mos_t = inv_f / avg_n
                 dos_t = mos_t * 30
             else:
                 mos_t = None
@@ -618,10 +653,5 @@ def _iterative_projection(
 
         if not any_negative:
             break
-
-        # Actualizar combined_sales con los nuevos Sales Out proyectados
-        # (los Sales Out no cambian, pero los inventarios si afectan)
-        # Los Sales Out proyectados son fijos, solo recalculamos con los
-        # nuevos inventarios como base
 
     return sales_in, inv_final, mos, dos

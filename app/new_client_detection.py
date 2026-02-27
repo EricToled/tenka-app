@@ -33,7 +33,7 @@ from .models import (
     FactStockCliente,
     RptForecastSinCatalogo,
 )
-from .monthly_close import _compute_month_minus_n
+from .monthly_close import _compute_month_minus_n, _compute_month_plus_n
 
 logger = logging.getLogger(__name__)
 
@@ -334,11 +334,4 @@ def project_new_client_skus(
     return projected_count
 
 
-def _compute_month_plus_n(date_id: int, n: int) -> int:
-    """Avanza n meses desde date_id (YYYYMM)."""
-    anio = date_id // 100
-    mes = date_id % 100
-    total_months = (anio * 12 + mes - 1) + n
-    new_anio = total_months // 12
-    new_mes = total_months % 12 + 1
-    return new_anio * 100 + new_mes
+# FIX LOG-08: _compute_month_plus_n removida — ahora importada desde monthly_close.py

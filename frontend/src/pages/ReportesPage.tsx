@@ -1,3 +1,7 @@
+/**
+ * FIX BUG-01: Los filtros de cliente y familia ahora se envian como query params a la API.
+ * FIX BUG-02: El selector de mes cierre se puebla dinamicamente desde /api/reports/available-months.
+ */
 import { useState, useEffect, useCallback } from 'react'
 import { TrendingUp, Package, AlertTriangle, ShieldAlert, BarChart3, Users } from 'lucide-react'
 import api from '../api/client'
@@ -19,6 +23,11 @@ interface ConstrainedData {
   by_cliente: any[]
 }
 
+interface MonthOption {
+  date_id: number
+  label: string
+}
+
 const numFmt = (v: any) => v !== null && v !== undefined ? Number(v).toLocaleString('es-MX', { maximumFractionDigits: 0 }) : '--'
 const pctFmt = (v: any) => v !== null && v !== undefined ? `${Number(v).toFixed(1)}%` : '--'
 
@@ -28,11 +37,12 @@ export default function ReportesPage() {
   const [familia, setFamilia] = useState('')
   const [clientes, setClientes] = useState<string[]>([])
   const [familias, setFamilias] = useState<string[]>([])
+  const [meses, setMeses] = useState<MonthOption[]>([])
   const [unc, setUnc] = useState<UnconstrainedData | null>(null)
   const [constr, setConstr] = useState<ConstrainedData | null>(null)
   const [loading, setLoading] = useState(false)
 
-  // Load filter options
+  // Load filter options (clients, familias, and available months)
   useEffect(() => {
     api.get('/api/catalog/clients').then(res => {
       setClientes(res.data.map((c: any) => c.cliente_nombre))
@@ -40,14 +50,30 @@ export default function ReportesPage() {
     api.get('/api/catalog/familias').then(res => {
       setFamilias(res.data)
     }).catch(() => {})
+    // FIX BUG-02: Cargar meses disponibles dinamicamente
+    api.get('/api/reports/available-months').then(res => {
+      setMeses(res.data)
+      // Si hay meses disponibles y el valor actual no esta en la lista, usar el primero
+      if (res.data.length > 0) {
+        const currentValid = res.data.some((m: MonthOption) => String(m.date_id) === mesCierre)
+        if (!currentValid) {
+          setMesCierre(String(res.data[0].date_id))
+        }
+      }
+    }).catch(() => {})
   }, [])
 
   const fetchData = useCallback(async () => {
     setLoading(true)
     try {
+      // FIX BUG-01: Enviar filtros de cliente y familia como query params
+      const params: Record<string, string> = {}
+      if (cliente) params.cliente = cliente
+      if (familia) params.familia = familia
+
       const [uncRes, constrRes] = await Promise.all([
-        api.get(`/api/reports/unconstrained-summary/${mesCierre}`),
-        api.get(`/api/reports/constrained-summary/${mesCierre}`),
+        api.get(`/api/reports/unconstrained-summary/${mesCierre}`, { params }),
+        api.get(`/api/reports/constrained-summary/${mesCierre}`, { params }),
       ])
       setUnc(uncRes.data)
       setConstr(constrRes.data)
@@ -56,7 +82,7 @@ export default function ReportesPage() {
     } finally {
       setLoading(false)
     }
-  }, [mesCierre])
+  }, [mesCierre, cliente, familia])
 
   useEffect(() => { fetchData() }, [fetchData])
 
@@ -140,7 +166,7 @@ export default function ReportesPage() {
         mesCierre={mesCierre} setMesCierre={setMesCierre}
         cliente={cliente} setCliente={setCliente}
         familia={familia} setFamilia={setFamilia}
-        clientes={clientes} familias={familias}
+        clientes={clientes} familias={familias} meses={meses}
         onRefresh={fetchData} loading={loading}
       />
 

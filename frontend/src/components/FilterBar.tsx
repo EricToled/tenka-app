@@ -1,3 +1,13 @@
+/**
+ * FIX BUG-02: Selector de mes ahora recibe opciones dinamicas desde la API.
+ * FIX BUG-01: Los filtros de cliente y familia ya se envian al API (ver ReportesPage).
+ */
+
+interface MonthOption {
+  date_id: number
+  label: string
+}
+
 interface Props {
   mesCierre: string
   setMesCierre: (v: string) => void
@@ -7,6 +17,7 @@ interface Props {
   setFamilia: (v: string) => void
   clientes: string[]
   familias: string[]
+  meses: MonthOption[]
   onRefresh: () => void
   loading?: boolean
 }
@@ -15,7 +26,7 @@ export default function FilterBar({
   mesCierre, setMesCierre,
   cliente, setCliente,
   familia, setFamilia,
-  clientes, familias,
+  clientes, familias, meses,
   onRefresh, loading,
 }: Props) {
   const selectClass =
@@ -24,7 +35,13 @@ export default function FilterBar({
   return (
     <div className="flex flex-wrap items-center gap-3 mb-6">
       <select value={mesCierre} onChange={(e) => setMesCierre(e.target.value)} className={selectClass}>
-        <option value="202507">Julio 2025 (202507)</option>
+        {meses.length > 0 ? (
+          meses.map((m) => (
+            <option key={m.date_id} value={String(m.date_id)}>{m.label}</option>
+          ))
+        ) : (
+          <option value={mesCierre}>{mesCierre}</option>
+        )}
       </select>
 
       <select value={cliente} onChange={(e) => setCliente(e.target.value)} className={selectClass}>

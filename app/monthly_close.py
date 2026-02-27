@@ -33,15 +33,18 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# Tablas históricas que participan en el rolling de 12 meses
-# Incluye fact_dias_inventario_historico (Fase 2) para mantener coherencia
+# Tablas históricas que participan en el rolling de 12 meses.
+# FIX BUG-06: FactDiasInventarioHistorico NO debe estar aqui.
+# El cierre borra M-12 ANTES de reconstruir DOS historicos (paso 3).
+# Si se incluye aqui, se borran los DOS del mes antiguo que son necesarios
+# para el recalculo posterior. build_historical_dos() en historical_dos.py
+# gestiona su propia limpieza y reconstruccion.
 FACT_TABLES = [
     FactSalesIn,
     FactSalesOut,
     FactStockCliente,
     FactInventarioInterno,
     FactInventarioTransito,
-    FactDiasInventarioHistorico,
 ]
 
 
@@ -62,6 +65,26 @@ def _compute_month_minus_n(date_id: int, n: int) -> int:
     nuevo_mes = (total_meses % 12) + 1
 
     return nuevo_anio * 100 + nuevo_mes
+
+
+def _compute_month_plus_n(date_id: int, n: int) -> int:
+    """
+    FIX LOG-08: Funcion centralizada (antes duplicada en constraint_demand.py
+    y new_client_detection.py).
+
+    Avanza n meses desde date_id (YYYYMM).
+    Maneja correctamente el cambio de año.
+
+    Ejemplo: _compute_month_plus_n(202507, 1)  → 202508
+             _compute_month_plus_n(202512, 1)  → 202601
+             _compute_month_plus_n(202507, 12) → 202607
+    """
+    anio = date_id // 100
+    mes = date_id % 100
+    total_months = (anio * 12 + mes - 1) + n
+    new_anio = total_months // 12
+    new_mes = total_months % 12 + 1
+    return new_anio * 100 + new_mes
 
 
 def run_monthly_close(session: Session, mes_cierre_date_id: int) -> dict:
